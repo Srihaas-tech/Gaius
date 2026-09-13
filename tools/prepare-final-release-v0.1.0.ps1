@@ -53,7 +53,8 @@ function Verify-PortableArtifact([string]$Profile) {
     $dist = Join-Path $root "port/web/dist/$Profile"
     $html = Join-Path $dist 'Gaius.html'
     $manifest = Join-Path $dist 'Gaius.manifest.json'
-    foreach ($required in @($html, $manifest)) {
+    $classes = Join-Path $dist 'classes.js'
+    foreach ($required in @($html, $manifest, $classes)) {
         if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { Fail "$Profile artifact is missing: $required" }
         if ((Get-Item -LiteralPath $required).Length -le 0) { Fail "$Profile artifact is empty: $required" }
     }
@@ -61,13 +62,19 @@ function Verify-PortableArtifact([string]$Profile) {
     if ([string]$portable.kind -ne 'gaius-portable-artifact' -or [string]$portable.profile -ne $Profile) {
         Fail "$Profile portable manifest identity is invalid"
     }
+    $classesInfo = Get-Item -LiteralPath $classes
+    $classesHash = (Get-FileHash -LiteralPath $classes -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ([long]$portable.classesJs.rawBytes -ne [long]$classesInfo.Length -or
+        [string]$portable.classesJs.rawSha256 -ne $classesHash) {
+        Fail "$Profile classes.js is inconsistent with Gaius.manifest.json (actual bytes=$($classesInfo.Length), hash=$classesHash; declared bytes=$($portable.classesJs.rawBytes), hash=$($portable.classesJs.rawSha256))"
+    }
     if ([string]$portable.classesJs.compiler.optimizationLevel -ne 'ADVANCED' -or
         $portable.classesJs.compiler.minifying -ne $true -or
         $portable.classesJs.compiler.assertionsRemoved -ne $true -or
         $portable.classesJs.compiler.shortFileNames -ne $true) {
         Fail "$Profile client is not release-grade ADVANCED/minified/assertions-removed/short-names"
     }
-    return [pscustomobject]@{ Profile = $Profile; Dist = $dist; Html = $html; Manifest = $manifest; Portable = $portable }
+    return [pscustomobject]@{ Profile = $Profile; Dist = $dist; Html = $html; Manifest = $manifest; Classes = $classes; Portable = $portable }
 }
 function Verify-ArtifactContract([string]$Profile, [string]$ContractPath, [object]$PortableProfile) {
     if (-not (Test-Path -LiteralPath $ContractPath -PathType Leaf)) { Fail "artifact contract is missing: $ContractPath" }
