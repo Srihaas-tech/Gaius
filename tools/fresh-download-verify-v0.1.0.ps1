@@ -65,7 +65,7 @@ function Verify-DownloadedAssets([string]$Directory, [string]$SourceHead) {
 
     try { $manifest = Get-Content -LiteralPath (Join-Path $Directory 'release.manifest.json') -Raw | ConvertFrom-Json }
     catch { Fail "release.manifest.json is invalid JSON: $($_.Exception.Message)" }
-    if ($manifest.schemaVersion -ne 3 -or $manifest.tag -ne 'v0.1.0' -or $manifest.version -ne '0.1.0') {
+    if ($manifest.schemaVersion -ne 4 -or $manifest.tag -ne 'v0.1.0' -or $manifest.version -ne '0.1.0') {
         Fail 'release.manifest.json identity/schema is invalid'
     }
     if ($manifest.sourceHead -ne $SourceHead) {
@@ -116,7 +116,7 @@ if ($SelfTest) {
         $i12111 = Get-Identity (Join-Path $directory 'Gaius-1.21.11.html')
         $i262 = Get-Identity (Join-Path $directory 'Gaius-26.2.html')
         $fixtureManifest = [ordered]@{
-            schemaVersion = 3; tag = 'v0.1.0'; version = '0.1.0'; sourceHead = $head
+            schemaVersion = 4; tag = 'v0.1.0'; version = '0.1.0'; sourceHead = $head
             artifacts = [ordered]@{
                 client12111 = [ordered]@{ file = 'Gaius-1.21.11.html'; identity = $i12111 }
                 client262 = [ordered]@{ file = 'Gaius-26.2.html'; identity = $i262 }
