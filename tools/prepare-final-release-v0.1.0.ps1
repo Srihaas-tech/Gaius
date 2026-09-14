@@ -3,7 +3,8 @@ param(
     [string]$Stage = 'port/target/release-v0.1.0-final-20260913',
     [Parameter(Mandatory = $true)][string]$Singleplayer12111Evidence,
     [Parameter(Mandatory = $true)][string]$Singleplayer262Evidence,
-    [Parameter(Mandatory = $true)][string]$MultiplayerEvidence
+    [Parameter(Mandatory = $true)][string]$Multiplayer12111Evidence,
+    [Parameter(Mandatory = $true)][string]$Multiplayer262Evidence
 )
 
 $ErrorActionPreference = 'Stop'
@@ -131,6 +132,44 @@ function Verify-Contract([object]$Portable) {
     Assert-SamePath (Resolve-Path -LiteralPath $contract.paths.manifest).Path $Portable.ManifestPath "$profile contract manifest"
     $path
 }
+function Verify-Multiplayer([string]$EvidencePath, [object]$Portable, [string]$Validator) {
+    $profile = $Portable.Profile
+    $evidence = Read-Json $EvidencePath "$profile multiplayer evidence"
+    if ($evidence.profile -ne $profile) {
+        Fail "$profile multiplayer evidence profile mismatch: $($evidence.profile)"
+    }
+
+    $priorTarget = $env:TARGET
+    $priorRelay = $env:RELAY
+    $priorArtifact = $env:ARTIFACT
+    $priorProfile = $env:PROFILE
+    $validatorOutput = $null
+    $validatorExitCode = $null
+    try {
+        $env:TARGET = 't40.sjcmc.cn:14803'
+        $env:RELAY = 'wss://ellan.site/tunnel'
+        $env:PROFILE = $profile
+        $env:ARTIFACT = $Portable.Html
+        $validatorOutput = & node $Validator $EvidencePath
+        $validatorExitCode = $LASTEXITCODE
+    } finally {
+        if ($null -eq $priorTarget) { Remove-Item Env:TARGET -ErrorAction SilentlyContinue } else { $env:TARGET = $priorTarget }
+        if ($null -eq $priorRelay) { Remove-Item Env:RELAY -ErrorAction SilentlyContinue } else { $env:RELAY = $priorRelay }
+        if ($null -eq $priorArtifact) { Remove-Item Env:ARTIFACT -ErrorAction SilentlyContinue } else { $env:ARTIFACT = $priorArtifact }
+        if ($null -eq $priorProfile) { Remove-Item Env:PROFILE -ErrorAction SilentlyContinue } else { $env:PROFILE = $priorProfile }
+    }
+    if ($validatorExitCode -ne 0) { Fail "$profile strict multiplayer terrain evidence validation failed" }
+    try { $terrain = $validatorOutput | Out-String | ConvertFrom-Json }
+    catch { Fail "$profile terrain validator returned invalid JSON: $($_.Exception.Message)" }
+    if ($terrain.success -ne $true -or [string]::IsNullOrWhiteSpace([string]$terrain.schema)) {
+        Fail "$profile strict multiplayer terrain evidence did not pass with a validator schema"
+    }
+    [pscustomobject]@{
+        Path = $EvidencePath
+        Identity = Get-Identity $EvidencePath
+        Terrain = $terrain
+    }
+}
 function Resolve-SafeStage([string]$Path) {
     $candidate = if ([IO.Path]::IsPathRooted($Path)) { [IO.Path]::GetFullPath($Path) } else { [IO.Path]::GetFullPath((Join-Path $root $Path)) }
     $targetRoot = [IO.Path]::GetFullPath((Join-Path $root 'port/target')).TrimEnd('\', '/')
@@ -152,7 +191,11 @@ $p12111 = Verify-Portable '1.21.11'
 $p262 = Verify-Portable '26.2'
 $single12111Path = Resolve-Input $Singleplayer12111Evidence '1.21.11 singleplayer evidence'
 $single262Path = Resolve-Input $Singleplayer262Evidence '26.2 singleplayer evidence'
-$multiplayerPath = Resolve-Input $MultiplayerEvidence '26.2 multiplayer evidence'
+$multiplayer12111Path = Resolve-Input $Multiplayer12111Evidence '1.21.11 multiplayer evidence'
+$multiplayer262Path = Resolve-Input $Multiplayer262Evidence '26.2 multiplayer evidence'
+if ([string]::Equals($multiplayer12111Path, $multiplayer262Path, [StringComparison]::OrdinalIgnoreCase)) {
+    Fail '1.21.11 and 26.2 multiplayer evidence must be independent files'
+}
 $single12111 = Verify-Single $single12111Path $p12111
 $single262 = Verify-Single $single262Path $p262
 $singleValidator = Join-Path $root 'tools/check-singleplayer-terrain-evidence.mjs'
@@ -174,23 +217,11 @@ $contract262 = Verify-Contract $p262
 
 $validator = Join-Path $root 'tools/check-multiplayer-terrain-evidence.mjs'
 if (-not (Test-Path -LiteralPath $validator -PathType Leaf)) { Fail "tracked multiplayer validator is missing: $validator" }
-$priorTarget = $env:TARGET
-$priorRelay = $env:RELAY
-$priorArtifact = $env:ARTIFACT
-try {
-    $env:TARGET = 't40.sjcmc.cn:14803'
-    $env:RELAY = 'wss://ellan.site/tunnel'
-    $env:ARTIFACT = $p262.Html
-    $validatorOutput = & node $validator $multiplayerPath
-} finally {
-    if ($null -eq $priorTarget) { Remove-Item Env:TARGET -ErrorAction SilentlyContinue } else { $env:TARGET = $priorTarget }
-    if ($null -eq $priorRelay) { Remove-Item Env:RELAY -ErrorAction SilentlyContinue } else { $env:RELAY = $priorRelay }
-    if ($null -eq $priorArtifact) { Remove-Item Env:ARTIFACT -ErrorAction SilentlyContinue } else { $env:ARTIFACT = $priorArtifact }
+$multiplayer12111 = Verify-Multiplayer $multiplayer12111Path $p12111 $validator
+$multiplayer262 = Verify-Multiplayer $multiplayer262Path $p262 $validator
+if ($multiplayer12111.Identity.sha256 -eq $multiplayer262.Identity.sha256) {
+    Fail '1.21.11 and 26.2 multiplayer evidence identities must be independent'
 }
-if ($LASTEXITCODE -ne 0) { Fail 'strict multiplayer terrain evidence validation failed' }
-try { $terrain = $validatorOutput | Out-String | ConvertFrom-Json }
-catch { Fail "terrain validator returned invalid JSON: $($_.Exception.Message)" }
-if ($terrain.success -ne $true) { Fail 'strict multiplayer terrain evidence did not pass' }
 
 $plugin = Join-Path $root 'apps/server-plugin/target/gaius-server-plugin-0.1.0.jar'
 $notesTemplate = Join-Path $root 'tools/release-v0.1.0-notes.md'
@@ -216,7 +247,7 @@ Copy-Item -LiteralPath $notesTemplate -Destination (Join-Path $stagePath 'RELEAS
 
 $head = (git rev-parse --verify HEAD).Trim()
 $releaseManifest = [ordered]@{
-    schemaVersion = 3; tag = 'v0.1.0'; version = '0.1.0'; sourceHead = $head
+    schemaVersion = 4; tag = 'v0.1.0'; version = '0.1.0'; sourceHead = $head
     sourceBranch = 'main'; artifactBuildReason = 'rebuilt-from-final-main'
     generatedAt = (Get-Date).ToUniversalTime().ToString('o'); profiles = @('1.21.11', '26.2')
     artifacts = [ordered]@{
@@ -231,7 +262,8 @@ $releaseManifest = [ordered]@{
     acceptanceEvidence = [ordered]@{
         '1.21.11.single' = [ordered]@{ file = [IO.Path]::GetFileName($single12111Path); identity = (Get-Identity $single12111Path); artifactIdentity = $single12111.Identity }
         '26.2.single' = [ordered]@{ file = [IO.Path]::GetFileName($single262Path); identity = (Get-Identity $single262Path); artifactIdentity = $single262.Identity }
-        '26.2.multiplayer' = [ordered]@{ file = [IO.Path]::GetFileName($multiplayerPath); identity = (Get-Identity $multiplayerPath); validatorSchema = $terrain.schema; status = 'passed' }
+        '1.21.11.multiplayer' = [ordered]@{ profile = '1.21.11'; file = [IO.Path]::GetFileName($multiplayer12111.Path); identity = $multiplayer12111.Identity; artifactIdentity = $p12111.HtmlIdentity; validatorSchema = $multiplayer12111.Terrain.schema; status = 'passed' }
+        '26.2.multiplayer' = [ordered]@{ profile = '26.2'; file = [IO.Path]::GetFileName($multiplayer262.Path); identity = $multiplayer262.Identity; artifactIdentity = $p262.HtmlIdentity; validatorSchema = $multiplayer262.Terrain.schema; status = 'passed' }
     }
     relay = [ordered]@{ url = 'wss://ellan.site/tunnel'; target = 't40.sjcmc.cn:14803'; strictTerrainGate = 'passed' }
     pages = [ordered]@{
@@ -250,5 +282,6 @@ Write-Host "Final release staging PASS: $stagePath" -ForegroundColor Green
 Write-Host "  exactAssets=8 sourceHead=$head"
 Write-Host "  1.21.11=$($p12111.HtmlIdentity.sha256) ($($p12111.HtmlIdentity.bytes) bytes)"
 Write-Host "  26.2=$($p262.HtmlIdentity.sha256) ($($p262.HtmlIdentity.bytes) bytes)"
-Write-Host "  multiplayer=ClientLevel, chunks>0 validator=$($terrain.schema)"
+Write-Host "  1.21.11 multiplayer=ClientLevel, chunks>0 validator=$($multiplayer12111.Terrain.schema)"
+Write-Host "  26.2 multiplayer=ClientLevel, chunks>0 validator=$($multiplayer262.Terrain.schema)"
 Write-Host 'No release upload, tag/ref mutation, push, or Pages dispatch was performed.' -ForegroundColor Yellow

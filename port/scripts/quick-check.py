@@ -9764,7 +9764,8 @@ def check_overlay_bytecode() -> None:
         (
             "Minecraft server-pack downloads use the browser HTTP bridge without Java Proxy",
             "dev/gaius/browser/BrowserHttpProxy.proxyResourcePack" in http_util_download
-            and "dev/gaius/browser/BrowserHttpProxy.browserSafeHeaders" in http_util_download
+            and "dev/gaius/browser/BrowserHttpProxy.browserSafeResourcePackHeaders"
+            in http_util_download
             and "java/net/URL.openConnection:(Ljava/net/Proxy;)" not in http_util_download
             and "java/net/URL.openConnection:()" in http_util_download,
         ),

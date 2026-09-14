@@ -97,6 +97,27 @@ jobs:
           )) {
             if (-not $publish.Contains($required)) { throw "publish gate missing: $required" }
           }
+          $prepare = Get-Content tools/prepare-final-release-v0.1.0.ps1 -Raw
+          foreach ($required in @(
+            'Multiplayer12111Evidence',
+            'Multiplayer262Evidence',
+            '''1.21.11.multiplayer''',
+            '''26.2.multiplayer''',
+            'schemaVersion = 4',
+            '$env:PROFILE'
+          )) {
+            if (-not $prepare.Contains($required)) { throw "dual-profile prepare gate missing: $required" }
+          }
+          foreach ($required in @(
+            'Multiplayer12111EvidencePath',
+            'Multiplayer262EvidencePath',
+            '''1.21.11.multiplayer''',
+            '''26.2.multiplayer''',
+            'schemaVersion -ne 4',
+            '$env:PROFILE'
+          )) {
+            if (-not $publish.Contains($required)) { throw "dual-profile publish gate missing: $required" }
+          }
           foreach ($required in @(
             'event -eq ''workflow_dispatch''',
             'headSha -eq $head',
@@ -130,6 +151,18 @@ jobs:
           }
           foreach ($required in @('CDP_COMMAND_TIMEOUT_MS', 'GAIUS_CDP_PROFILE_ROOT', 'rejectPending', 'timed out after')) {
             if (-not $pages.Contains($required)) { throw "Pages CDP timeout gate missing: $required" }
+          }
+          foreach ($required in @(
+            'resource-packs/008381d7a89976709aa86bb71dee06dc50bb3961.zip',
+            '61_102_872',
+            '008381d7a89976709aa86bb71dee06dc50bb3961',
+            'ee96a1fe577a90f1c2a3f686cdec060a3cbf0f127ae8e0585cb79dd93e69e172',
+            'Network.getResponseBody',
+            'declaredContentLength',
+            'loadingFinished',
+            'resource-pack-exact-get-content-length-loading-finished-body-hashes'
+          )) {
+            if (-not $pages.Contains($required)) { throw "Pages fixed resource-pack gate missing: $required" }
           }
           $pagesWorkflow = Get-Content .github/workflows/pages.yml -Raw
           foreach ($required in @('run-name:', 'release_token:', 'required: true')) {

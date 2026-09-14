@@ -15,7 +15,7 @@ import {
 const sleep = (milliseconds) => new Promise((done) => setTimeout(done, milliseconds));
 const expectedResourcePack = Object.freeze({
   originalUrl: 'https://jihulab.com/-/project/356228/uploads/e409655d230380173547e68c5ef026d4/resource_pack.zip',
-  fixedMirrorUrl: 'https://typethe0ry.github.io/Gaius/proxy/resource-pack',
+  fixedMirrorUrl: 'https://typethe0ry.github.io/Gaius/resource-packs/008381d7a89976709aa86bb71dee06dc50bb3961.zip',
   bytes: 61_102_872,
   sha1: '008381d7a89976709aa86bb71dee06dc50bb3961',
   sha256: 'ee96a1fe577a90f1c2a3f686cdec060a3cbf0f127ae8e0585cb79dd93e69e172',

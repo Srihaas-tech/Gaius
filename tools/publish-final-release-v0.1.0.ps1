@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$EvidencePath,
+    [Parameter(Mandatory = $true)][string]$Multiplayer12111EvidencePath,
+    [Parameter(Mandatory = $true)][string]$Multiplayer262EvidencePath,
     [string]$Stage = 'port/target/release-v0.1.0-final-20260913',
     [string]$Repo = 'TypeThe0ry/Gaius',
     [int]$PagesTimeoutSeconds = 1200,
@@ -51,6 +52,77 @@ function Get-PagesRuns {
     try { @($json | ConvertFrom-Json) }
     catch { Fail "gh run list returned invalid JSON: $($_.Exception.Message)" }
 }
+function Resolve-EvidencePath([string]$Path, [string]$Profile) {
+    $resolved = if ([IO.Path]::IsPathRooted($Path)) {
+        [IO.Path]::GetFullPath($Path)
+    } else {
+        [IO.Path]::GetFullPath((Join-Path $root $Path))
+    }
+    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+        Fail "$Profile multiplayer evidence is missing: $resolved"
+    }
+    $resolved
+}
+function Revalidate-MultiplayerEvidence(
+    [string]$Profile,
+    [string]$EvidencePath,
+    [object]$DeclaredEvidence,
+    [string]$ArtifactPath,
+    [string]$Validator
+) {
+    try { $evidence = Get-Content -LiteralPath $EvidencePath -Raw | ConvertFrom-Json }
+    catch { Fail "$Profile multiplayer evidence is invalid JSON: $($_.Exception.Message)" }
+    if ($evidence.profile -ne $Profile) {
+        Fail "$Profile multiplayer evidence profile mismatch: $($evidence.profile)"
+    }
+    $evidenceIdentity = [pscustomobject]@{
+        bytes = [long](Get-Item -LiteralPath $EvidencePath).Length
+        sha256 = (Get-FileHash -LiteralPath $EvidencePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    if ($DeclaredEvidence.profile -ne $Profile -or $DeclaredEvidence.status -ne 'passed' -or
+        [string]::IsNullOrWhiteSpace([string]$DeclaredEvidence.validatorSchema) -or
+        $DeclaredEvidence.file -ne [IO.Path]::GetFileName($EvidencePath) -or
+        [long]$DeclaredEvidence.identity.bytes -ne $evidenceIdentity.bytes -or
+        [string]$DeclaredEvidence.identity.sha256 -ne $evidenceIdentity.sha256) {
+        Fail "$Profile supplied multiplayer evidence does not match the prepared release manifest"
+    }
+
+    $artifactIdentity = [pscustomobject]@{
+        bytes = [long](Get-Item -LiteralPath $ArtifactPath).Length
+        sha256 = (Get-FileHash -LiteralPath $ArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    if ([long]$DeclaredEvidence.artifactIdentity.bytes -ne $artifactIdentity.bytes -or
+        [string]$DeclaredEvidence.artifactIdentity.sha256 -ne $artifactIdentity.sha256) {
+        Fail "$Profile multiplayer manifest artifact identity is stale"
+    }
+
+    $priorTarget = $env:TARGET
+    $priorRelay = $env:RELAY
+    $priorArtifact = $env:ARTIFACT
+    $priorProfile = $env:PROFILE
+    $validatorOutput = $null
+    $validatorExitCode = $null
+    try {
+        $env:TARGET = 't40.sjcmc.cn:14803'
+        $env:RELAY = 'wss://ellan.site/tunnel'
+        $env:PROFILE = $Profile
+        $env:ARTIFACT = $ArtifactPath
+        $validatorOutput = & node $Validator $EvidencePath
+        $validatorExitCode = $LASTEXITCODE
+    } finally {
+        if ($null -eq $priorTarget) { Remove-Item Env:TARGET -ErrorAction SilentlyContinue } else { $env:TARGET = $priorTarget }
+        if ($null -eq $priorRelay) { Remove-Item Env:RELAY -ErrorAction SilentlyContinue } else { $env:RELAY = $priorRelay }
+        if ($null -eq $priorArtifact) { Remove-Item Env:ARTIFACT -ErrorAction SilentlyContinue } else { $env:ARTIFACT = $priorArtifact }
+        if ($null -eq $priorProfile) { Remove-Item Env:PROFILE -ErrorAction SilentlyContinue } else { $env:PROFILE = $priorProfile }
+    }
+    if ($validatorExitCode -ne 0) { Fail "$Profile tracked multiplayer evidence revalidation failed" }
+    try { $validation = $validatorOutput | Out-String | ConvertFrom-Json }
+    catch { Fail "$Profile multiplayer validator returned invalid JSON: $($_.Exception.Message)" }
+    if ($validation.success -ne $true -or $validation.schema -ne $DeclaredEvidence.validatorSchema) {
+        Fail "$Profile multiplayer validator status/schema does not match the prepared release manifest"
+    }
+    $validation | ConvertTo-Json -Depth 12 | Out-Host
+}
 
 $stagePath = if ([IO.Path]::IsPathRooted($Stage)) { [IO.Path]::GetFullPath($Stage) } else { [IO.Path]::GetFullPath((Join-Path $root $Stage)) }
 $targetRoot = [IO.Path]::GetFullPath((Join-Path $root 'port/target')).TrimEnd('\', '/')
@@ -66,39 +138,33 @@ foreach ($name in $requiredAssets) {
 try { $manifest = Get-Content -LiteralPath (Join-Path $stagePath 'release.manifest.json') -Raw | ConvertFrom-Json }
 catch { Fail "release.manifest.json is invalid JSON: $($_.Exception.Message)" }
 $head = (git rev-parse --verify HEAD).Trim()
-if ($manifest.schemaVersion -ne 3 -or $manifest.tag -ne $tag -or $manifest.sourceHead -ne $head -or
+if ($manifest.schemaVersion -ne 4 -or $manifest.tag -ne $tag -or $manifest.sourceHead -ne $head -or
     $manifest.artifactBuildReason -ne 'rebuilt-from-final-main') {
     Fail "release manifest is stale or invalid for HEAD $head"
 }
 if ($manifest.relay.target -ne 't40.sjcmc.cn:14803' -or $manifest.relay.url -ne 'wss://ellan.site/tunnel' -or
-    $manifest.relay.strictTerrainGate -ne 'passed' -or $manifest.acceptanceEvidence.'26.2.multiplayer'.status -ne 'passed') {
+    $manifest.relay.strictTerrainGate -ne 'passed' -or
+    $manifest.acceptanceEvidence.'1.21.11.multiplayer'.status -ne 'passed' -or
+    $manifest.acceptanceEvidence.'26.2.multiplayer'.status -ne 'passed') {
     Fail 'release manifest strict multiplayer gate is not passed'
 }
 
-$resolvedEvidence = if ([IO.Path]::IsPathRooted($EvidencePath)) { [IO.Path]::GetFullPath($EvidencePath) } else { [IO.Path]::GetFullPath((Join-Path $root $EvidencePath)) }
-if (-not (Test-Path -LiteralPath $resolvedEvidence -PathType Leaf)) { Fail "multiplayer evidence is missing: $resolvedEvidence" }
-$evidenceIdentity = [pscustomobject]@{
-    bytes = [long](Get-Item -LiteralPath $resolvedEvidence).Length
-    sha256 = (Get-FileHash -LiteralPath $resolvedEvidence -Algorithm SHA256).Hash.ToLowerInvariant()
+$resolved12111Evidence = Resolve-EvidencePath $Multiplayer12111EvidencePath '1.21.11'
+$resolved262Evidence = Resolve-EvidencePath $Multiplayer262EvidencePath '26.2'
+if ([string]::Equals($resolved12111Evidence, $resolved262Evidence, [StringComparison]::OrdinalIgnoreCase)) {
+    Fail '1.21.11 and 26.2 multiplayer evidence must be independent files'
 }
-$declaredEvidence = $manifest.acceptanceEvidence.'26.2.multiplayer'
-if ($declaredEvidence.file -ne [IO.Path]::GetFileName($resolvedEvidence) -or
-    [long]$declaredEvidence.identity.bytes -ne $evidenceIdentity.bytes -or
-    [string]$declaredEvidence.identity.sha256 -ne $evidenceIdentity.sha256) {
-    Fail 'supplied multiplayer evidence does not match the prepared release manifest'
+$resolved12111EvidenceSha256 = (Get-FileHash -LiteralPath $resolved12111Evidence -Algorithm SHA256).Hash.ToLowerInvariant()
+$resolved262EvidenceSha256 = (Get-FileHash -LiteralPath $resolved262Evidence -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($resolved12111EvidenceSha256 -eq $resolved262EvidenceSha256) {
+    Fail '1.21.11 and 26.2 multiplayer evidence identities must be independent'
 }
-$priorTarget = $env:TARGET; $priorRelay = $env:RELAY; $priorArtifact = $env:ARTIFACT
-try {
-    $env:TARGET = 't40.sjcmc.cn:14803'
-    $env:RELAY = 'wss://ellan.site/tunnel'
-    $env:ARTIFACT = Join-Path $stagePath 'Gaius-26.2.html'
-    & node (Join-Path $root 'tools/check-multiplayer-terrain-evidence.mjs') $resolvedEvidence | Out-Host
-    if ($LASTEXITCODE -ne 0) { Fail 'tracked multiplayer evidence revalidation failed' }
-} finally {
-    if ($null -eq $priorTarget) { Remove-Item Env:TARGET -ErrorAction SilentlyContinue } else { $env:TARGET = $priorTarget }
-    if ($null -eq $priorRelay) { Remove-Item Env:RELAY -ErrorAction SilentlyContinue } else { $env:RELAY = $priorRelay }
-    if ($null -eq $priorArtifact) { Remove-Item Env:ARTIFACT -ErrorAction SilentlyContinue } else { $env:ARTIFACT = $priorArtifact }
-}
+$multiplayerValidator = Join-Path $root 'tools/check-multiplayer-terrain-evidence.mjs'
+if (-not (Test-Path -LiteralPath $multiplayerValidator -PathType Leaf)) { Fail 'tracked multiplayer validator is missing' }
+Revalidate-MultiplayerEvidence '1.21.11' $resolved12111Evidence `
+    $manifest.acceptanceEvidence.'1.21.11.multiplayer' (Join-Path $stagePath 'Gaius-1.21.11.html') $multiplayerValidator
+Revalidate-MultiplayerEvidence '26.2' $resolved262Evidence `
+    $manifest.acceptanceEvidence.'26.2.multiplayer' (Join-Path $stagePath 'Gaius-26.2.html') $multiplayerValidator
 
 $sumBytes = [IO.File]::ReadAllBytes((Join-Path $stagePath 'SHA256SUMS'))
 if (@($sumBytes | Where-Object { $_ -eq 13 }).Count -ne 0) { Fail 'SHA256SUMS contains CR bytes' }

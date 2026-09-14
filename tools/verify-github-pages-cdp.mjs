@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { createServer } from 'node:net';
@@ -11,6 +12,13 @@ const chromeBinary = process.env.CHROME || 'C:/Program Files/Google/Chrome/Appli
 const expectedRelay = process.env.RELAY || 'wss://ellan.site/tunnel';
 const expectedTarget = process.env.TARGET || 't40.sjcmc.cn:14803';
 const cdpCommandTimeoutMs = Number(process.env.CDP_COMMAND_TIMEOUT_MS || '15000');
+const resourcePackCdpTimeoutMs = 120_000;
+const expectedResourcePack = Object.freeze({
+  url: 'https://typethe0ry.github.io/Gaius/resource-packs/008381d7a89976709aa86bb71dee06dc50bb3961.zip',
+  bytes: 61_102_872,
+  sha1: '008381d7a89976709aa86bb71dee06dc50bb3961',
+  sha256: 'ee96a1fe577a90f1c2a3f686cdec060a3cbf0f127ae8e0585cb79dd93e69e172',
+});
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 if (!Number.isInteger(cdpCommandTimeoutMs) || cdpCommandTimeoutMs < 1000) {
@@ -170,6 +178,32 @@ function check(results, name, ok, detail = '') {
   results.push({ name, ok: Boolean(ok), detail: String(detail) });
 }
 
+function responseHeader(headers, name) {
+  const expected = String(name).toLowerCase();
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (String(key).toLowerCase() === expected) return String(value);
+  }
+  return null;
+}
+
+function verifiedExpectedResourcePackTransaction(transaction) {
+  const body = transaction?.bodyVerification;
+  return transaction?.requestUrl === expectedResourcePack.url
+    && transaction?.responseUrl === expectedResourcePack.url
+    && transaction?.method === 'GET'
+    && Number(transaction?.status) >= 200
+    && Number(transaction?.status) < 300
+    && Number(transaction?.declaredContentLength) === expectedResourcePack.bytes
+    && transaction?.loadingFinished === true
+    && Number(transaction?.encodedDataLength) > 0
+    && !transaction?.loadingFailed
+    && body?.base64Encoded === true
+    && Number(body?.bytes) === expectedResourcePack.bytes
+    && body?.sha1 === expectedResourcePack.sha1
+    && body?.sha256 === expectedResourcePack.sha256
+    && !body?.error;
+}
+
 function pagesFinalGate({ checks, error, cleanup }) {
   return !error
     && checks.every((entry) => entry.ok)
@@ -185,6 +219,36 @@ if (process.argv.includes('--static-self-test')) {
   assert.equal(pagesFinalGate({ ...ready, cleanup: { chromeExited: false, profileRemoved: true } }), false);
   assert.equal(pagesFinalGate({ ...ready, cleanup: { chromeExited: true, profileRemoved: false } }), false);
   assert.equal(pagesFinalGate({ ...ready, error: 'failure' }), false);
+
+  const exactPack = {
+    requestUrl: expectedResourcePack.url,
+    responseUrl: expectedResourcePack.url,
+    method: 'GET',
+    status: 200,
+    declaredContentLength: expectedResourcePack.bytes,
+    loadingFinished: true,
+    encodedDataLength: expectedResourcePack.bytes,
+    loadingFailed: null,
+    bodyVerification: {
+      base64Encoded: true,
+      bytes: expectedResourcePack.bytes,
+      sha1: expectedResourcePack.sha1,
+      sha256: expectedResourcePack.sha256,
+    },
+  };
+  assert.equal(verifiedExpectedResourcePackTransaction(exactPack), true);
+  assert.equal(verifiedExpectedResourcePackTransaction({
+    ...exactPack,
+    declaredContentLength: expectedResourcePack.bytes - 1,
+  }), false);
+  assert.equal(verifiedExpectedResourcePackTransaction({
+    ...exactPack,
+    loadingFinished: false,
+  }), false);
+  assert.equal(verifiedExpectedResourcePackTransaction({
+    ...exactPack,
+    bodyVerification: { ...exactPack.bodyVerification, sha256: '0'.repeat(64) },
+  }), false);
 
   class FakeSocket extends EventTarget {
     constructor() {
@@ -278,14 +342,84 @@ try {
   await cdp.open();
   cdp.on('Runtime.exceptionThrown', (event) => report.exceptions.push(
     event.exceptionDetails?.exception?.description || event.exceptionDetails?.text || 'runtime exception'));
-  await Promise.all([cdp.send('Runtime.enable'), cdp.send('Page.enable'), cdp.send('Network.enable')]);
+  const resourcePackTransactions = new Map();
+  const pendingResourcePackBodyVerifications = [];
+  cdp.on('Network.requestWillBeSent', (event) => {
+    const requestUrl = String(event.request?.url || '');
+    if (requestUrl !== expectedResourcePack.url) return;
+    resourcePackTransactions.set(event.requestId, {
+      requestId: event.requestId,
+      requestUrl,
+      responseUrl: null,
+      method: event.request?.method || '',
+      status: null,
+      declaredContentLength: null,
+      loadingFinished: false,
+      loadingFailed: null,
+    });
+  });
+  cdp.on('Network.responseReceived', (event) => {
+    const transaction = resourcePackTransactions.get(event.requestId);
+    if (!transaction) return;
+    transaction.responseUrl = String(event.response?.url || '');
+    transaction.status = event.response?.status ?? null;
+    transaction.declaredContentLength = responseHeader(event.response?.headers, 'content-length');
+  });
+  cdp.on('Network.loadingFinished', (event) => {
+    const transaction = resourcePackTransactions.get(event.requestId);
+    if (!transaction) return;
+    transaction.loadingFinished = true;
+    transaction.encodedDataLength = event.encodedDataLength ?? null;
+    const verification = (async () => {
+      try {
+        const result = await cdp.send('Network.getResponseBody', {
+          requestId: event.requestId,
+        }, resourcePackCdpTimeoutMs);
+        if (result.base64Encoded !== true) {
+          throw new Error('CDP returned the binary resource pack without base64 encoding');
+        }
+        const body = Buffer.from(result.body || '', 'base64');
+        transaction.bodyVerification = {
+          base64Encoded: true,
+          bytes: body.length,
+          sha1: createHash('sha1').update(body).digest('hex'),
+          sha256: createHash('sha256').update(body).digest('hex'),
+        };
+      } catch (error) {
+        transaction.bodyVerification = {
+          base64Encoded: false,
+          bytes: null,
+          sha1: null,
+          sha256: null,
+          error: String(error?.stack || error),
+        };
+      }
+    })();
+    pendingResourcePackBodyVerifications.push(verification);
+  });
+  cdp.on('Network.loadingFailed', (event) => {
+    const transaction = resourcePackTransactions.get(event.requestId);
+    if (!transaction) return;
+    transaction.loadingFailed = {
+      errorText: event.errorText || 'loading failed',
+      canceled: Boolean(event.canceled),
+    };
+  });
+  await Promise.all([
+    cdp.send('Runtime.enable'),
+    cdp.send('Page.enable'),
+    cdp.send('Network.enable', {
+      maxTotalBufferSize: 128 * 1024 * 1024,
+      maxResourceBufferSize: 96 * 1024 * 1024,
+    }),
+  ]);
 
-  const evaluate = async (expression) => {
+  const evaluate = async (expression, timeoutMs = cdpCommandTimeoutMs) => {
     const response = await cdp.send('Runtime.evaluate', {
       expression,
       returnByValue: true,
       awaitPromise: true,
-    });
+    }, timeoutMs);
     if (response.exceptionDetails) {
       throw new Error(response.exceptionDetails.exception?.description
         || response.exceptionDetails.text || 'Runtime.evaluate failed');
@@ -362,6 +496,42 @@ try {
     check(report.checks, `${profile}-launch-relay-param`, launch.searchParams.get('relay') === expectedRelay && launch.searchParams.get('bridge') === expectedRelay, launch.search);
     check(report.checks, `${profile}-launch-server-param`, launch.searchParams.get('server') === expectedTarget && launch.searchParams.get('directPlugin') === '0', launch.search);
   }
+
+  const resourcePackFetch = await evaluate(`(async () => {
+    const response = await fetch(${JSON.stringify(expectedResourcePack.url)}, { cache: 'no-store' });
+    const body = await response.arrayBuffer();
+    return { url: response.url, status: response.status, bytes: body.byteLength };
+  })()`, resourcePackCdpTimeoutMs);
+  // Runtime.evaluate and Network.loadingFinished are independent CDP messages.  Even though the
+  // page-side arrayBuffer() has completed, give the event handler time to enqueue and finish its
+  // Network.getResponseBody verification instead of taking a one-time snapshot of the promise list.
+  const resourcePackEventDeadline = Date.now() + 10_000;
+  while (Date.now() < resourcePackEventDeadline) {
+    await Promise.allSettled([...pendingResourcePackBodyVerifications]);
+    const transactions = [...resourcePackTransactions.values()];
+    if (transactions.some(verifiedExpectedResourcePackTransaction)) break;
+    if (transactions.length > 0 && transactions.every((transaction) =>
+      transaction.loadingFailed || (transaction.loadingFinished && transaction.bodyVerification))) {
+      break;
+    }
+    await sleep(50);
+  }
+  const resourcePackTransactionList = [...resourcePackTransactions.values()];
+  const verifiedResourcePack = resourcePackTransactionList.find(
+    verifiedExpectedResourcePackTransaction,
+  ) || null;
+  report.resourcePack = {
+    expected: expectedResourcePack,
+    browserFetch: resourcePackFetch,
+    transactions: resourcePackTransactionList,
+    verified: Boolean(verifiedResourcePack),
+  };
+  check(report.checks, 'resource-pack-browser-fetch', resourcePackFetch?.url === expectedResourcePack.url
+    && Number(resourcePackFetch?.status) >= 200 && Number(resourcePackFetch?.status) < 300
+    && Number(resourcePackFetch?.bytes) === expectedResourcePack.bytes,
+  JSON.stringify(resourcePackFetch));
+  check(report.checks, 'resource-pack-exact-get-content-length-loading-finished-body-hashes',
+    Boolean(verifiedResourcePack), JSON.stringify(resourcePackTransactionList));
 
   check(report.checks, 'runtime-exceptions-clean', report.exceptions.length === 0, `exceptions=${report.exceptions.length}`);
 } catch (error) {
