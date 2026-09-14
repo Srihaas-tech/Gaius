@@ -142,7 +142,15 @@ function localHost(sessionId) {
   port1.__gaiusLaunchGeneration = "1";
   runtime.__gaiusSingleplayerWorkers.get(sessionB).__gaiusClientPort = port1;
   setTimeout(() => runtime.__gaiusLocalServerPorts.set(sessionB, port1), 20);
+  // Reproduce an overloaded CI runner: both the 8 ms retry and 20 ms
+  // registration timer become overdue, but the retry was queued first. The
+  // bridge must let the already-due registration run before its final timeout
+  // decision rather than retiring a port that was produced within the window.
+  const starvationUntil = Date.now() + 120;
+  while (Date.now() < starvationUntil) {}
   await waitFor(() => runtime.__gaiusNetworkStats.localOpened === 1, "late port claim");
+  assert.equal(runtime.__gaiusNetworkStats.localClaimTimeouts, 0,
+    "overdue retry timed out before the already-due registration ran");
   assert.equal(runtime.__gaiusNettyBridge.pollError(2), null,
     "late port registration produced a transport error");
   runtime.__gaiusNettyBridge.close(2);

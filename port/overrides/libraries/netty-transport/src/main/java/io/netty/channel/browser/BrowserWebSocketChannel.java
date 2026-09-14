@@ -1869,6 +1869,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               clearTimeout(entry.localClaimTimer);
               entry.localClaimTimer = 0;
             }
+            entry.localClaimDeadlineCheckPending = false;
             entry.localClaimGeneration++;
             }
             function clearCandidateTimeout(entry) {
@@ -1901,6 +1902,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               clearTimeout(entry.localClaimTimer);
               entry.localClaimTimer = 0;
             }
+            entry.localClaimDeadlineCheckPending = false;
             tryClaimLocalPort(entry, entry.localClaimGeneration);
             }
             function localWorkerOwnsPort(entry, localPort) {
@@ -2008,7 +2010,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             requestFlush(entry);
             return true;
             }
-            function tryClaimLocalPort(entry, generation) {
+            function tryClaimLocalPort(entry, generation, finalDeadlineCheck) {
             if (entry.closed || entry.connected || generation !== entry.localClaimGeneration) {
               return;
             }
@@ -2048,6 +2050,28 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               return;
             }
             if (Date.now() >= entry.localClaimDeadline) {
+              // A throttled event loop can make this retry run after the deadline
+              // even though an earlier-due Worker registration timer is already
+              // queued behind it. Yield one macrotask turn before the final check
+              // so expired registration work can publish its MessagePort first.
+              // This does not extend the claim window or permit repeated grace
+              // turns: the next empty check fails closed.
+              if (!finalDeadlineCheck) {
+                if (entry.localClaimDeadlineCheckPending) return;
+                entry.localClaimDeadlineCheckPending = true;
+                state.stats.localClaimRetries++;
+                entry.localClaimTimer = setTimeout(function() {
+                  entry.localClaimTimer = 0;
+                  if (entry.closed || entry.connected ||
+                      generation !== entry.localClaimGeneration) {
+                    entry.localClaimDeadlineCheckPending = false;
+                    return;
+                  }
+                  entry.localClaimDeadlineCheckPending = false;
+                  tryClaimLocalPort(entry, generation, true);
+                }, 0);
+                return;
+              }
               state.stats.localClaimTimeouts++;
               fail(
                 entry,
@@ -2565,6 +2589,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               localPort: null,
               localSessionId: null,
               localClaimTimer: 0,
+              localClaimDeadlineCheckPending: false,
               localClaimGeneration: 0,
               localLaunchGeneration: '',
               localGenerationRequired: false,
