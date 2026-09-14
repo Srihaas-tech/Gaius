@@ -10,7 +10,11 @@ const base = String(process.env.GAIUS_PAGES_BASE || 'https://typethe0ry.github.i
 const output = resolve(process.env.OUTPUT || 'artifacts/github-pages-cdp.json');
 const chromeBinary = process.env.CHROME || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
 const expectedRelay = process.env.RELAY || 'wss://ellan.site/tunnel';
-const expectedTarget = process.env.TARGET || 't40.sjcmc.cn:14803';
+const expectedDefaultTarget = process.env.TARGET || 't40.sjcmc.cn:14803';
+const expectedTargets = Object.freeze({
+  '1.21.11': process.env.GAIUS_TARGET_12111 || expectedDefaultTarget,
+  '26.2': process.env.GAIUS_TARGET_262 || expectedDefaultTarget,
+});
 const cdpCommandTimeoutMs = Number(process.env.CDP_COMMAND_TIMEOUT_MS || '15000');
 const resourcePackCdpTimeoutMs = 120_000;
 const expectedResourcePack = Object.freeze({
@@ -315,6 +319,10 @@ function pagesFinalGate({ checks, error, cleanup }) {
 }
 
 if (process.argv.includes('--static-self-test')) {
+  assert.deepEqual(expectedTargets, {
+    '1.21.11': process.env.GAIUS_TARGET_12111 || expectedDefaultTarget,
+    '26.2': process.env.GAIUS_TARGET_262 || expectedDefaultTarget,
+  });
   const ready = { checks: [{ ok: true }], error: null, cleanup: {
     cdpClosed: true, chromeExited: true, processIdentityClean: true, profileRemoved: true,
   } };
@@ -405,6 +413,7 @@ const report = {
   schema: 'gaius.github-pages-cdp-acceptance.v1',
   base,
   checkedAt: new Date().toISOString(),
+  expectedTargets,
   checks: [],
   pages: [],
   exceptions: [],
@@ -567,7 +576,7 @@ try {
       && snapshot?.readyState === 'complete' && snapshot?.title.includes('Gaius'),
     `expected=${url}; actual=${snapshot?.href}; title=${snapshot?.title}`);
     check(report.checks, `${path || 'home'}-relay-default`, snapshot?.relay === expectedRelay, snapshot?.relay);
-    check(report.checks, `${path || 'home'}-target-default`, snapshot?.target === expectedTarget, snapshot?.target);
+    check(report.checks, `${path || 'home'}-target-default`, snapshot?.target === expectedDefaultTarget, snapshot?.target);
     check(report.checks, `${path || 'home'}-registry-rendered`, snapshot?.status?.includes(expectedRelay), snapshot?.status?.slice(0, 240));
   }
 
@@ -582,6 +591,7 @@ try {
   check(report.checks, 'relay-registry-node', registry?.nodes?.some((node) => node.url === expectedRelay), JSON.stringify(registry?.nodes || []));
 
   for (const profile of ['1.21.11', '26.2']) {
+    const expectedTarget = expectedTargets[profile];
     const pageUrl = new URL(`${profile}/`, base).href;
     await cdp.send('Page.navigate', { url: pageUrl });
     let pageReady = false;

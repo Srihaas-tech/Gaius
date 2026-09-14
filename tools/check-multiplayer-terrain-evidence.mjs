@@ -306,7 +306,10 @@ export async function validateEvidence(evidencePath, options = {}) {
       if (!identityOk) continue;
       const recomputedVisual = analyzeTerrainPng(png);
       const visualPass = terrainVisualPass(recomputedVisual);
-      const declaredPass = entry.terrainVisualPass === true && terrainVisualPass(entry.visual);
+      const declaredVisualPass = entry.terrainVisualPass === true;
+      const declaredMetricsPass = terrainVisualPass(entry.visual);
+      const declarationMatch = declaredVisualPass === visualPass
+        && declaredMetricsPass === visualPass;
       const metricsMatch = [
         'sourceWidth', 'sourceHeight', 'sampleWidth', 'sampleHeight',
         'lowerTexturedTileCount', 'lowerTexturedRowCount', 'lowerTexturedColumnCount',
@@ -316,8 +319,15 @@ export async function validateEvidence(evidencePath, options = {}) {
           'centralDominantColorRatio', 'lowerLuminanceStdDev', 'lowerEdgeDensity',
         ].every((name) => Math.abs(Number(entry.visual?.[name]) - Number(recomputedVisual[name])) <= 1e-9);
       checks.push(gate(`terrain-visual-recomputed:${entry.label || entry.path}`,
-        visualPass && declaredPass && metricsMatch,
-        JSON.stringify({ visualPass, declaredPass, metricsMatch, recomputedVisual })));
+        metricsMatch && declarationMatch,
+        JSON.stringify({
+          visualPass,
+          declaredVisualPass,
+          declaredMetricsPass,
+          declarationMatch,
+          metricsMatch,
+          recomputedVisual,
+        })));
       verifiedScreenshots.push({
         path: screenshotPath,
         ...actual,
@@ -388,6 +398,7 @@ async function runStaticSelfTest() {
   try {
     const artifact = join(directory, 'Gaius.html');
     const screenshot = join(directory, 'terrain-1.png');
+    const earlyScreenshot = join(directory, 'terrain-early.png');
     const evidencePath = join(directory, 'evidence.json');
     await writeFile(artifact, 'compiled-gaius-fixture');
     const terrainPng = createTerrainVisualFixture();
@@ -544,6 +555,41 @@ async function runStaticSelfTest() {
     const skyHudVisual = analyzeTerrainPng(skyHudPng);
     assert.ok(skyHudVisual.colorBuckets >= 8);
     assert.equal(terrainVisualPass(skyHudVisual), false);
+    await writeFile(earlyScreenshot, skyHudPng);
+    const earlyScreenshotHash = await hashFile(earlyScreenshot);
+
+    // The runner starts retaining frames as soon as terrain first appears.
+    // An early frame may legitimately fail the visual threshold while a later
+    // stable frame passes. Both declarations must match independently, and the
+    // aggregate visual gate must accept the evidence because one frame passes.
+    const mixedVisualEvidence = structuredClone(evidence);
+    mixedVisualEvidence.screenshotIdentity = [{
+      path: earlyScreenshot,
+      label: 'terrain-early',
+      ...earlyScreenshotHash,
+      terrainVisualPass: false,
+      visual: skyHudVisual,
+    }, {
+      path: screenshot,
+      label: 'terrain-1',
+      ...screenshotHash,
+      terrainVisualPass: true,
+      visual: terrainVisual,
+    }];
+    mixedVisualEvidence.final.screenshots = [earlyScreenshot, screenshot];
+    await writeFile(evidencePath, `${JSON.stringify(mixedVisualEvidence, null, 2)}\n`);
+    const mixedVisualAccepted = await validateEvidence(evidencePath, {
+      expectedTarget: target,
+      expectedRelay: relay,
+      expectedArtifact: artifact,
+    });
+    assert.equal(mixedVisualAccepted.success, true);
+    assert.equal(mixedVisualAccepted.verifiedScreenshots.length, 2);
+    assert.equal(mixedVisualAccepted.checks.find((entry) =>
+      entry.name === 'terrain-visual-recomputed:terrain-early')?.ok, true);
+    assert.equal(mixedVisualAccepted.checks.find((entry) =>
+      entry.name === 'terrain-screenshot-visual')?.ok, true);
+
     await writeFile(screenshot, skyHudPng);
     const skyHudHash = await hashFile(screenshot);
     evidence.screenshotIdentity[0] = {

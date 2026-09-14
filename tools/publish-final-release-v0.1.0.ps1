@@ -80,6 +80,8 @@ function Revalidate-MultiplayerEvidence(
         sha256 = (Get-FileHash -LiteralPath $EvidencePath -Algorithm SHA256).Hash.ToLowerInvariant()
     }
     if ($DeclaredEvidence.profile -ne $Profile -or $DeclaredEvidence.status -ne 'passed' -or
+        [string]::IsNullOrWhiteSpace([string]$DeclaredEvidence.target) -or
+        [string]::IsNullOrWhiteSpace([string]$DeclaredEvidence.relay) -or
         [string]::IsNullOrWhiteSpace([string]$DeclaredEvidence.validatorSchema) -or
         $DeclaredEvidence.file -ne [IO.Path]::GetFileName($EvidencePath) -or
         [long]$DeclaredEvidence.identity.bytes -ne $evidenceIdentity.bytes -or
@@ -103,8 +105,8 @@ function Revalidate-MultiplayerEvidence(
     $validatorOutput = $null
     $validatorExitCode = $null
     try {
-        $env:TARGET = 't40.sjcmc.cn:14803'
-        $env:RELAY = 'wss://ellan.site/tunnel'
+        $env:TARGET = [string]$DeclaredEvidence.target
+        $env:RELAY = [string]$DeclaredEvidence.relay
         $env:PROFILE = $Profile
         $env:ARTIFACT = $ArtifactPath
         $validatorOutput = & node $Validator $EvidencePath
@@ -142,7 +144,14 @@ if ($manifest.schemaVersion -ne 4 -or $manifest.tag -ne $tag -or $manifest.sourc
     $manifest.artifactBuildReason -ne 'rebuilt-from-final-main') {
     Fail "release manifest is stale or invalid for HEAD $head"
 }
-if ($manifest.relay.target -ne 't40.sjcmc.cn:14803' -or $manifest.relay.url -ne 'wss://ellan.site/tunnel' -or
+if ($manifest.relay.url -ne 'wss://ellan.site/tunnel' -or
+    [string]::IsNullOrWhiteSpace([string]$manifest.relay.targets.'1.21.11') -or
+    [string]::IsNullOrWhiteSpace([string]$manifest.relay.targets.'26.2') -or
+    $manifest.relay.target -ne $manifest.relay.targets.'1.21.11' -or
+    $manifest.acceptanceEvidence.'1.21.11.multiplayer'.target -ne $manifest.relay.targets.'1.21.11' -or
+    $manifest.acceptanceEvidence.'26.2.multiplayer'.target -ne $manifest.relay.targets.'26.2' -or
+    $manifest.acceptanceEvidence.'1.21.11.multiplayer'.relay -ne $manifest.relay.url -or
+    $manifest.acceptanceEvidence.'26.2.multiplayer'.relay -ne $manifest.relay.url -or
     $manifest.relay.strictTerrainGate -ne 'passed' -or
     $manifest.acceptanceEvidence.'1.21.11.multiplayer'.status -ne 'passed' -or
     $manifest.acceptanceEvidence.'26.2.multiplayer'.status -ne 'passed') {
@@ -283,6 +292,10 @@ $pagesVerifier = Join-Path $root 'tools/verify-github-pages-cdp.mjs'
 if (-not (Test-Path -LiteralPath $pagesVerifier -PathType Leaf)) { Fail 'tracked GitHub Pages CDP verifier is missing' }
 $priorOutput = $env:OUTPUT
 $priorProfileRoot = $env:GAIUS_CDP_PROFILE_ROOT
+$priorPagesTarget = $env:TARGET
+$priorPagesRelay = $env:RELAY
+$priorPagesTarget12111 = $env:GAIUS_TARGET_12111
+$priorPagesTarget262 = $env:GAIUS_TARGET_262
 $pagesVerifierTempRoot = Join-Path ([IO.Path]::GetTempPath()) ("gaius-pages-publish-" + [Guid]::NewGuid().ToString('N'))
 $pagesVerifierStdout = Join-Path $pagesVerifierTempRoot 'stdout.log'
 $pagesVerifierStderr = Join-Path $pagesVerifierTempRoot 'stderr.log'
@@ -293,6 +306,10 @@ try {
     [void](New-Item -ItemType Directory -Path $pagesVerifierTempRoot -Force)
     $env:OUTPUT = if ([IO.Path]::IsPathRooted($PagesEvidence)) { $PagesEvidence } else { Join-Path $root $PagesEvidence }
     $env:GAIUS_CDP_PROFILE_ROOT = $pagesVerifierTempRoot
+    $env:TARGET = [string]$manifest.relay.target
+    $env:RELAY = [string]$manifest.relay.url
+    $env:GAIUS_TARGET_12111 = [string]$manifest.relay.targets.'1.21.11'
+    $env:GAIUS_TARGET_262 = [string]$manifest.relay.targets.'26.2'
     $node = Get-Command node -ErrorAction Stop
     # Start-Process joins ArgumentList entries into one command line. Preserve
     # the verifier path as one argv item when the checkout path contains spaces.
@@ -321,6 +338,10 @@ try {
 } finally {
     if ($null -eq $priorOutput) { Remove-Item Env:OUTPUT -ErrorAction SilentlyContinue } else { $env:OUTPUT = $priorOutput }
     if ($null -eq $priorProfileRoot) { Remove-Item Env:GAIUS_CDP_PROFILE_ROOT -ErrorAction SilentlyContinue } else { $env:GAIUS_CDP_PROFILE_ROOT = $priorProfileRoot }
+    if ($null -eq $priorPagesTarget) { Remove-Item Env:TARGET -ErrorAction SilentlyContinue } else { $env:TARGET = $priorPagesTarget }
+    if ($null -eq $priorPagesRelay) { Remove-Item Env:RELAY -ErrorAction SilentlyContinue } else { $env:RELAY = $priorPagesRelay }
+    if ($null -eq $priorPagesTarget12111) { Remove-Item Env:GAIUS_TARGET_12111 -ErrorAction SilentlyContinue } else { $env:GAIUS_TARGET_12111 = $priorPagesTarget12111 }
+    if ($null -eq $priorPagesTarget262) { Remove-Item Env:GAIUS_TARGET_262 -ErrorAction SilentlyContinue } else { $env:GAIUS_TARGET_262 = $priorPagesTarget262 }
     for ($attempt = 0; $attempt -lt 20 -and (Test-Path -LiteralPath $pagesVerifierTempRoot); $attempt++) {
         Remove-Item -LiteralPath $pagesVerifierTempRoot -Recurse -Force -ErrorAction SilentlyContinue
         if (Test-Path -LiteralPath $pagesVerifierTempRoot) { Start-Sleep -Milliseconds 250 }

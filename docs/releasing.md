@@ -44,6 +44,26 @@ done
 These probes check STATUS, target attestation, and tunnel release, not LOGIN
 or PLAY. Keep their actual scope in release notes.
 
+The final `v0.1.0` prepare gate accepts independent multiplayer targets for
+each compiled profile while keeping one audited RelayNode. Defaults remain the
+public probe above; override only when the saved Chrome/CDP evidence was
+captured against different profile-specific servers:
+
+```powershell
+./tools/prepare-final-release-v0.1.0.ps1 `
+  -Singleplayer12111Evidence artifacts/file-entry-1.21.11.json `
+  -Singleplayer262Evidence artifacts/file-entry-26.2.json `
+  -Multiplayer12111Evidence artifacts/join-terrain-1.21.11.json `
+  -Multiplayer262Evidence artifacts/join-terrain-26.2.json `
+  -Multiplayer12111Target 'legacy.example:25565' `
+  -Multiplayer262Target 'modern.example:25565'
+```
+
+The two targets are bound into each evidence declaration and into
+`release.manifest.json` under `relay.targets`. Publish and fresh-download gates
+revalidate those exact target/relay bindings, and the Pages CDP gate injects
+the matching target for each profile.
+
 From a clean source checkout, build each supported Minecraft profile in its
 own state and output roots. The wrapper never changes `port/config.json` and
 does not reuse the legacy shared `port/target`, `port/work/overlays`, or

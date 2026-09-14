@@ -4,7 +4,9 @@ param(
     [Parameter(Mandatory = $true)][string]$Singleplayer12111Evidence,
     [Parameter(Mandatory = $true)][string]$Singleplayer262Evidence,
     [Parameter(Mandatory = $true)][string]$Multiplayer12111Evidence,
-    [Parameter(Mandatory = $true)][string]$Multiplayer262Evidence
+    [Parameter(Mandatory = $true)][string]$Multiplayer262Evidence,
+    [string]$Multiplayer12111Target = 't40.sjcmc.cn:14803',
+    [string]$Multiplayer262Target = 't40.sjcmc.cn:14803'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -12,6 +14,7 @@ Set-StrictMode -Version Latest
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 Set-Location -LiteralPath $root
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
+$multiplayerRelay = 'wss://ellan.site/tunnel'
 $requiredAssets = @(
     'Gaius-1.21.11.html', 'Gaius-1.21.11.manifest.json',
     'Gaius-26.2.html', 'Gaius-26.2.manifest.json',
@@ -132,8 +135,16 @@ function Verify-Contract([object]$Portable) {
     Assert-SamePath (Resolve-Path -LiteralPath $contract.paths.manifest).Path $Portable.ManifestPath "$profile contract manifest"
     $path
 }
-function Verify-Multiplayer([string]$EvidencePath, [object]$Portable, [string]$Validator) {
+function Verify-Multiplayer(
+    [string]$EvidencePath,
+    [object]$Portable,
+    [string]$Validator,
+    [string]$ExpectedTarget,
+    [string]$ExpectedRelay
+) {
     $profile = $Portable.Profile
+    if ([string]::IsNullOrWhiteSpace($ExpectedTarget)) { Fail "$profile multiplayer target was not supplied" }
+    if ([string]::IsNullOrWhiteSpace($ExpectedRelay)) { Fail "$profile multiplayer relay was not supplied" }
     $evidence = Read-Json $EvidencePath "$profile multiplayer evidence"
     if ($evidence.profile -ne $profile) {
         Fail "$profile multiplayer evidence profile mismatch: $($evidence.profile)"
@@ -146,8 +157,8 @@ function Verify-Multiplayer([string]$EvidencePath, [object]$Portable, [string]$V
     $validatorOutput = $null
     $validatorExitCode = $null
     try {
-        $env:TARGET = 't40.sjcmc.cn:14803'
-        $env:RELAY = 'wss://ellan.site/tunnel'
+        $env:TARGET = $ExpectedTarget
+        $env:RELAY = $ExpectedRelay
         $env:PROFILE = $profile
         $env:ARTIFACT = $Portable.Html
         $validatorOutput = & node $Validator $EvidencePath
@@ -168,6 +179,8 @@ function Verify-Multiplayer([string]$EvidencePath, [object]$Portable, [string]$V
         Path = $EvidencePath
         Identity = Get-Identity $EvidencePath
         Terrain = $terrain
+        Target = $ExpectedTarget
+        Relay = $ExpectedRelay
     }
 }
 function Resolve-SafeStage([string]$Path) {
@@ -217,8 +230,8 @@ $contract262 = Verify-Contract $p262
 
 $validator = Join-Path $root 'tools/check-multiplayer-terrain-evidence.mjs'
 if (-not (Test-Path -LiteralPath $validator -PathType Leaf)) { Fail "tracked multiplayer validator is missing: $validator" }
-$multiplayer12111 = Verify-Multiplayer $multiplayer12111Path $p12111 $validator
-$multiplayer262 = Verify-Multiplayer $multiplayer262Path $p262 $validator
+$multiplayer12111 = Verify-Multiplayer $multiplayer12111Path $p12111 $validator $Multiplayer12111Target $multiplayerRelay
+$multiplayer262 = Verify-Multiplayer $multiplayer262Path $p262 $validator $Multiplayer262Target $multiplayerRelay
 if ($multiplayer12111.Identity.sha256 -eq $multiplayer262.Identity.sha256) {
     Fail '1.21.11 and 26.2 multiplayer evidence identities must be independent'
 }
@@ -262,10 +275,15 @@ $releaseManifest = [ordered]@{
     acceptanceEvidence = [ordered]@{
         '1.21.11.single' = [ordered]@{ file = [IO.Path]::GetFileName($single12111Path); identity = (Get-Identity $single12111Path); artifactIdentity = $single12111.Identity }
         '26.2.single' = [ordered]@{ file = [IO.Path]::GetFileName($single262Path); identity = (Get-Identity $single262Path); artifactIdentity = $single262.Identity }
-        '1.21.11.multiplayer' = [ordered]@{ profile = '1.21.11'; file = [IO.Path]::GetFileName($multiplayer12111.Path); identity = $multiplayer12111.Identity; artifactIdentity = $p12111.HtmlIdentity; validatorSchema = $multiplayer12111.Terrain.schema; status = 'passed' }
-        '26.2.multiplayer' = [ordered]@{ profile = '26.2'; file = [IO.Path]::GetFileName($multiplayer262.Path); identity = $multiplayer262.Identity; artifactIdentity = $p262.HtmlIdentity; validatorSchema = $multiplayer262.Terrain.schema; status = 'passed' }
+        '1.21.11.multiplayer' = [ordered]@{ profile = '1.21.11'; target = $multiplayer12111.Target; relay = $multiplayer12111.Relay; file = [IO.Path]::GetFileName($multiplayer12111.Path); identity = $multiplayer12111.Identity; artifactIdentity = $p12111.HtmlIdentity; validatorSchema = $multiplayer12111.Terrain.schema; status = 'passed' }
+        '26.2.multiplayer' = [ordered]@{ profile = '26.2'; target = $multiplayer262.Target; relay = $multiplayer262.Relay; file = [IO.Path]::GetFileName($multiplayer262.Path); identity = $multiplayer262.Identity; artifactIdentity = $p262.HtmlIdentity; validatorSchema = $multiplayer262.Terrain.schema; status = 'passed' }
     }
-    relay = [ordered]@{ url = 'wss://ellan.site/tunnel'; target = 't40.sjcmc.cn:14803'; strictTerrainGate = 'passed' }
+    relay = [ordered]@{
+        url = $multiplayerRelay
+        target = $Multiplayer12111Target
+        targets = [ordered]@{ '1.21.11' = $Multiplayer12111Target; '26.2' = $Multiplayer262Target }
+        strictTerrainGate = 'passed'
+    }
     pages = [ordered]@{
         home = 'https://typethe0ry.github.io/Gaius/'; '1.21.11' = 'https://typethe0ry.github.io/Gaius/1.21.11/'
         '26.2' = 'https://typethe0ry.github.io/Gaius/26.2/'; relayRegistry = 'https://typethe0ry.github.io/Gaius/relay-nodes.json'

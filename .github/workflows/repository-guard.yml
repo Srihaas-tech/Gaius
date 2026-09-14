@@ -103,6 +103,8 @@ jobs:
             'Multiplayer262Evidence',
             '''1.21.11.multiplayer''',
             '''26.2.multiplayer''',
+            'Multiplayer12111Target',
+            'Multiplayer262Target',
             'schemaVersion = 4',
             '$env:PROFILE'
           )) {
@@ -113,6 +115,8 @@ jobs:
             'Multiplayer262EvidencePath',
             '''1.21.11.multiplayer''',
             '''26.2.multiplayer''',
+            'GAIUS_TARGET_12111',
+            'GAIUS_TARGET_262',
             'schemaVersion -ne 4',
             '$env:PROFILE'
           )) {
@@ -148,6 +152,9 @@ jobs:
           $pages = Get-Content tools/verify-github-pages-cdp.mjs -Raw
           foreach ($required in @('cdpClosed', 'chromeExited', 'profileRemoved', 'pagesFinalGate')) {
             if (-not $pages.Contains($required)) { throw "Pages CDP gate missing: $required" }
+          }
+          foreach ($required in @('GAIUS_TARGET_12111', 'GAIUS_TARGET_262', 'expectedTargets')) {
+            if (-not $pages.Contains($required)) { throw "Pages per-profile target gate missing: $required" }
           }
           foreach ($required in @('CDP_COMMAND_TIMEOUT_MS', 'GAIUS_CDP_PROFILE_ROOT', 'rejectPending', 'timed out after')) {
             if (-not $pages.Contains($required)) { throw "Pages CDP timeout gate missing: $required" }

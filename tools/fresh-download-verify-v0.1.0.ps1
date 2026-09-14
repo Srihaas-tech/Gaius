@@ -71,8 +71,17 @@ function Verify-DownloadedAssets([string]$Directory, [string]$SourceHead) {
     if ($manifest.sourceHead -ne $SourceHead) {
         Fail "sourceHead mismatch (download=$($manifest.sourceHead) expected=$SourceHead)"
     }
-    if ($manifest.relay.target -ne 't40.sjcmc.cn:14803' -or $manifest.relay.url -ne 'wss://ellan.site/tunnel' -or
-        $manifest.relay.strictTerrainGate -ne 'passed' -or $manifest.acceptanceEvidence.'26.2.multiplayer'.status -ne 'passed') {
+    if ($manifest.relay.url -ne 'wss://ellan.site/tunnel' -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.relay.targets.'1.21.11') -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.relay.targets.'26.2') -or
+        $manifest.relay.target -ne $manifest.relay.targets.'1.21.11' -or
+        $manifest.relay.strictTerrainGate -ne 'passed' -or
+        $manifest.acceptanceEvidence.'1.21.11.multiplayer'.status -ne 'passed' -or
+        $manifest.acceptanceEvidence.'26.2.multiplayer'.status -ne 'passed' -or
+        $manifest.acceptanceEvidence.'1.21.11.multiplayer'.target -ne $manifest.relay.targets.'1.21.11' -or
+        $manifest.acceptanceEvidence.'26.2.multiplayer'.target -ne $manifest.relay.targets.'26.2' -or
+        $manifest.acceptanceEvidence.'1.21.11.multiplayer'.relay -ne $manifest.relay.url -or
+        $manifest.acceptanceEvidence.'26.2.multiplayer'.relay -ne $manifest.relay.url) {
         Fail 'release manifest strict RelayNode terrain gate is invalid'
     }
     foreach ($entry in @(
@@ -121,8 +130,15 @@ if ($SelfTest) {
                 client12111 = [ordered]@{ file = 'Gaius-1.21.11.html'; identity = $i12111 }
                 client262 = [ordered]@{ file = 'Gaius-26.2.html'; identity = $i262 }
             }
-            acceptanceEvidence = [ordered]@{ '26.2.multiplayer' = [ordered]@{ status = 'passed' } }
-            relay = [ordered]@{ target = 't40.sjcmc.cn:14803'; url = 'wss://ellan.site/tunnel'; strictTerrainGate = 'passed' }
+            acceptanceEvidence = [ordered]@{
+                '1.21.11.multiplayer' = [ordered]@{ status = 'passed'; target = 'legacy.example:25565'; relay = 'wss://ellan.site/tunnel' }
+                '26.2.multiplayer' = [ordered]@{ status = 'passed'; target = 'modern.example:25565'; relay = 'wss://ellan.site/tunnel' }
+            }
+            relay = [ordered]@{
+                target = 'legacy.example:25565'
+                targets = [ordered]@{ '1.21.11' = 'legacy.example:25565'; '26.2' = 'modern.example:25565' }
+                url = 'wss://ellan.site/tunnel'; strictTerrainGate = 'passed'
+            }
         }
         [IO.File]::WriteAllText((Join-Path $directory 'release.manifest.json'), (($fixtureManifest | ConvertTo-Json -Depth 8) + "`n"), [Text.UTF8Encoding]::new($false))
         $hashLines = foreach ($file in Get-ChildItem -LiteralPath $directory -Force -File | Sort-Object Name) {
