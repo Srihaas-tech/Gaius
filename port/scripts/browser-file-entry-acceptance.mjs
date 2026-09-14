@@ -33,6 +33,23 @@ class Cdp {
   close() { this.ws.close(); }
 }
 const sleep = ms => new Promise(r=>setTimeout(r,ms));
+async function waitForExit(child, ms) {
+  if (child.exitCode != null || child.signalCode != null) return true;
+  return await Promise.race([
+    new Promise(resolve => child.once("exit", () => resolve(true))),
+    sleep(ms).then(() => false),
+  ]);
+}
+async function removeChromeProfile(path) {
+  try {
+    // Crashpad can retain CrashpadMetrics-active.pma briefly after the browser
+    // process exits on Windows. fs.rm's retry options cover that normal race.
+    await rm(path,{recursive:true,force:true,maxRetries:20,retryDelay:250});
+  } catch (error) {
+    if (!["EBUSY","EPERM","ENOTEMPTY"].includes(error?.code)) throw error;
+    console.warn(`Chrome profile cleanup deferred: ${error.message}`);
+  }
+}
 async function waitJson(url, ms) { const end=Date.now()+ms; let last; while(Date.now()<end){try{const r=await fetch(url);if(r.ok)return r.json();last=new Error(`${r.status}`);}catch(e){last=e;}await sleep(100);}throw new Error(`timeout ${url}: ${last}`); }
 async function evaluate(cdp, expression) { const r=await cdp.send("Runtime.evaluate",{expression,awaitPromise:true,returnByValue:true}); if(r.exceptionDetails) throw new Error(r.exceptionDetails.text||"Runtime.evaluate failed"); return r.result?.value; }
 async function waitFor(cdp, expression, ms, label) { const end=Date.now()+ms; let last; while(Date.now()<end){try{if(await evaluate(cdp,expression))return;}catch(e){last=e;}await sleep(250);}throw new Error(`timeout waiting for ${label}${last?`: ${last.message}`:""}`); }
@@ -120,4 +137,12 @@ try {
   const result={schemaVersion:1,profile:profileId,artifact,targetUrl,mode,completed:true,success:true,titleScreen:title,runtime,consoleMessages,exceptions,failedResources,siblingFileRequests,blobUrls,chromeOutput:chromeOutput.join("").slice(-10000),capturedAt:new Date().toISOString()};
   success=exceptions.length===0&&criticalFailedResources.length===0&&siblingFileRequests.length===0&&runtime.protocol==="file:"&&runtime.portableBuild===true&&blobUrls.length>=3; await mkdir(dirname(output),{recursive:true}); await writeFile(output,JSON.stringify({...result,success},null,2)+"\n"); console.log(JSON.stringify({output,profile:profileId,mode,success,titleScreen:title,screen:runtime.screen,level:runtime.level,storage:runtime.storage,idb:runtime.idb,wasm:runtime.wasm,exceptions:exceptions.length,failedResources:failedResources.length,siblingFileRequests:siblingFileRequests.length},null,2)); if(!success)throw new Error("file acceptance invariants failed");
   } catch(error) { let diagnostic=null; try { diagnostic=await evaluate(cdp,`(()=>{const b=window.__gaiusNettyBridge;return {href:location.href,screen:window.__gaiusMinecraftState?.screen||null,level:!!window.__gaiusMinecraftState?.level,body:(document.body?.innerText||'').slice(0,4000),state:window.__gaiusMinecraftState||null,workers:window.__gaiusSingleplayerWorkers?Array.from(window.__gaiusSingleplayerWorkers.entries()).map(([k,v])=>({key:k,state:v?.state||null,worldgen:v?.worldgen||null,ready:v?.ready||null})):null,events:(window.__gaiusMinecraftEvents||[]).slice(-80),bridgeType:typeof b,bridgeKeys:b?Object.keys(b):null,networkStats:window.__gaiusNetworkStats||null,bridgeStats:b?.stats||null,bridgeInitTrace:window.__gaiusNettyBridgeInitTrace||[],bridgeInitError:window.__gaiusNettyBridgeInitError||null,portableBridgeTrace:window.__gaiusPortableBridgeTrace||[],bridgeTrace:window.__gaiusBridgeTrace||[],bridgeOwn:globalThis===window?Object.getOwnPropertyNames(window).filter(k=>k.toLowerCase().includes('bridge')||k.toLowerCase().includes('network')):[],resources:performance.getEntriesByType('resource').map(x=>({name:x.name,duration:x.duration,transferSize:x.transferSize}))};})()`); } catch(_) {} await mkdir(dirname(output),{recursive:true}); await writeFile(output,JSON.stringify({schemaVersion:1,profile:profileId,artifact,targetUrl,mode,completed:false,success:false,error:String(error.stack||error),diagnostic,consoleMessages,exceptions,failedResources,chromeOutput:chromeOutput.join("").slice(-20000),capturedAt:new Date().toISOString()},null,2)+"\n"); console.error(error.stack||error); process.exitCode=1;
-} finally { cdp?.close(); chrome.kill("SIGTERM"); await Promise.race([new Promise(r=>chrome.once("exit",r)),sleep(2000)]); if(chrome.exitCode==null)chrome.kill("SIGKILL"); await rm(profileDir,{recursive:true,force:true}); }
+} finally {
+  cdp?.close();
+  chrome.kill("SIGTERM");
+  if (!(await waitForExit(chrome,5000))) {
+    chrome.kill("SIGKILL");
+    await waitForExit(chrome,5000);
+  }
+  await removeChromeProfile(profileDir);
+}

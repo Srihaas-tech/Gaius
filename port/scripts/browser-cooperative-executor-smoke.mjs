@@ -19,5 +19,14 @@ assert.match(source,
   "Worker runtime probe is missing");
 assert.match(source, /return new BrowserCooperativeExecutor\(delegate\);/,
   "foreground callers must retain the cooperative executor");
+assert.match(source, /Platform\.startThread\(this::runAfterYield\);/,
+  "cooperative pump must enter a TeaVM native thread before suspendable work");
+assert.doesNotMatch(source, /Platform\.schedule\(this::runAfterYield,\s*0\);/,
+  "raw Platform.schedule callbacks cannot suspend resource-pack downloads");
 
-console.log(JSON.stringify({ok: true, workerBypass: true, foregroundCooperative: true}));
+console.log(JSON.stringify({
+  ok: true,
+  workerBypass: true,
+  foregroundCooperative: true,
+  nativeThreadPump: true,
+}));
