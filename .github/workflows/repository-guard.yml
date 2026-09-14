@@ -45,6 +45,130 @@ jobs:
       - name: Validate release metadata and screenshots
         run: node tools/check-release-metadata.mjs
 
+      - name: Validate final release gate scripts and fixtures
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node --check tools/browser-multiplayer-terrain-cdp.mjs
+          node tools/browser-multiplayer-terrain-cdp.mjs --static-self-test
+          node --check tools/check-multiplayer-terrain-evidence.mjs
+          node tools/check-multiplayer-terrain-evidence.mjs --static-self-test
+          node --check tools/check-singleplayer-terrain-evidence.mjs
+          node tools/check-singleplayer-terrain-evidence.mjs --static-self-test
+          node --check port/scripts/browser-file-entry-acceptance.mjs
+          node port/scripts/browser-file-entry-acceptance.mjs --static-self-test
+          node --check tools/verify-github-pages-cdp.mjs
+          node tools/verify-github-pages-cdp.mjs --static-self-test
+          ./tools/fresh-download-verify-v0.1.0.ps1 -SelfTest
+          $files = @(
+            'tools/prepare-final-release-v0.1.0.ps1',
+            'tools/publish-final-release-v0.1.0.ps1',
+            'tools/fresh-download-verify-v0.1.0.ps1',
+            'verify-1.21.11-release-node.ps1'
+          )
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $file), [ref]$tokens, [ref]$errors)
+            if ($errors.Count -ne 0) {
+              throw "$file PowerShell parse errors: $($errors -join '; ')"
+            }
+          }
+          $publish = Get-Content tools/publish-final-release-v0.1.0.ps1 -Raw
+          foreach ($required in @(
+            '--clobber',
+            'fresh-download-verify-v0.1.0.ps1',
+            'gh workflow run pages.yml',
+            'gh run list',
+            'gh run view',
+            'tools/verify-github-pages-cdp.mjs',
+            'workflow_dispatch',
+            'release_token',
+            'displayTitle',
+            'createdAt',
+            'PagesVerifierTimeoutSeconds',
+            'Start-Process',
+            'GAIUS_CDP_PROFILE_ROOT',
+            'taskkill',
+            'Assert-TagUnchanged',
+            'gh release delete-asset',
+            'git ls-remote origin'
+          )) {
+            if (-not $publish.Contains($required)) { throw "publish gate missing: $required" }
+          }
+          $prepare = Get-Content tools/prepare-final-release-v0.1.0.ps1 -Raw
+          foreach ($required in @(
+            'Multiplayer12111Evidence',
+            'Multiplayer262Evidence',
+            '''1.21.11.multiplayer''',
+            '''26.2.multiplayer''',
+            'schemaVersion = 4',
+            '$env:PROFILE'
+          )) {
+            if (-not $prepare.Contains($required)) { throw "dual-profile prepare gate missing: $required" }
+          }
+          foreach ($required in @(
+            'Multiplayer12111EvidencePath',
+            'Multiplayer262EvidencePath',
+            '''1.21.11.multiplayer''',
+            '''26.2.multiplayer''',
+            'schemaVersion -ne 4',
+            '$env:PROFILE'
+          )) {
+            if (-not $publish.Contains($required)) { throw "dual-profile publish gate missing: $required" }
+          }
+          foreach ($required in @(
+            'event -eq ''workflow_dispatch''',
+            'headSha -eq $head',
+            'displayTitle -eq $expectedPagesTitle',
+            'createdAt -ge $pagesDispatchNotBefore'
+          )) {
+            if (-not $publish.Contains($required)) { throw "Pages run identity gate missing: $required" }
+          }
+          foreach ($forbidden in @(
+            'release-v0.1.0-final-20260913-clobber.ps1',
+            'release-v0.1.0-fresh-download-verify.ps1',
+            'Gaius-migration-2026-08-14',
+            '_tmp'
+          )) {
+            if ($publish.Contains($forbidden)) { throw "publish gate has external/ignored dependency: $forbidden" }
+          }
+          foreach ($forbidden in @('git tag', 'git push', 'release create', '--tag ')) {
+            if ($publish.Contains($forbidden)) { throw "publish gate may mutate the tag/ref: $forbidden" }
+          }
+          $single = Get-Content port/scripts/browser-file-entry-acceptance.mjs -Raw
+          foreach ($required in @('singleRuntime', 'cdpClosed', 'chromeExited', 'profileRemoved', 'artifactUnchanged', 'terrainVisualPass', 'loadedChunkCount', 'chunkEventCount')) {
+            if (-not $single.Contains($required)) { throw "single acceptance gate missing: $required" }
+          }
+          $singleValidator = Get-Content tools/check-singleplayer-terrain-evidence.mjs -Raw
+          foreach ($required in @('terrain-visual-recomputed', 'terrain-screenshot-identity', 'artifact-identity')) {
+            if (-not $singleValidator.Contains($required)) { throw "single evidence validator missing: $required" }
+          }
+          $pages = Get-Content tools/verify-github-pages-cdp.mjs -Raw
+          foreach ($required in @('cdpClosed', 'chromeExited', 'profileRemoved', 'pagesFinalGate')) {
+            if (-not $pages.Contains($required)) { throw "Pages CDP gate missing: $required" }
+          }
+          foreach ($required in @('CDP_COMMAND_TIMEOUT_MS', 'GAIUS_CDP_PROFILE_ROOT', 'rejectPending', 'timed out after')) {
+            if (-not $pages.Contains($required)) { throw "Pages CDP timeout gate missing: $required" }
+          }
+          foreach ($required in @(
+            'resource-packs/008381d7a89976709aa86bb71dee06dc50bb3961.zip',
+            '61_102_872',
+            '008381d7a89976709aa86bb71dee06dc50bb3961',
+            'ee96a1fe577a90f1c2a3f686cdec060a3cbf0f127ae8e0585cb79dd93e69e172',
+            'Network.getResponseBody',
+            'declaredContentLength',
+            'loadingFinished',
+            'resource-pack-exact-get-content-length-loading-finished-body-hashes'
+          )) {
+            if (-not $pages.Contains($required)) { throw "Pages fixed resource-pack gate missing: $required" }
+          }
+          $pagesWorkflow = Get-Content .github/workflows/pages.yml -Raw
+          foreach ($required in @('run-name:', 'release_token:', 'required: true')) {
+            if (-not $pagesWorkflow.Contains($required)) { throw "Pages workflow release token gate missing: $required" }
+          }
+
       - name: Validate launcher version and artifact identity
         run: |
           set -euo pipefail
@@ -146,6 +270,8 @@ jobs:
           node port/scripts/singleplayer-worker-slow-sample-smoke.mjs
           node port/scripts/chunk-pipeline-telemetry-smoke.mjs
           node port/scripts/chunk-layer-barrier-smoke.mjs
+          node port/scripts/browser-cooperative-executor-smoke.mjs
+          node port/scripts/download-queue-cooperative-patch-smoke.mjs
           node port/scripts/browser-compression-decoder-production-smoke.mjs
           node port/scripts/gson-type-token-external-overlay-smoke.mjs
           node port/scripts/worldgen-scheduler-smoke.mjs

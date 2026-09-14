@@ -261,6 +261,8 @@ public final class MinecraftClientPatcher {
         patchLanServerPinger(args[0], root.resolve(
                 "net/minecraft/client/server/LanServerPinger.class"));
         patchHttpUtil(args[0], root.resolve("net/minecraft/util/HttpUtil.class"));
+        patchDownloadQueueBrowser(args[0], root.resolve(
+                "net/minecraft/server/packs/DownloadQueue.class"));
         patchSkinTextureDownloader(args[0], root.resolve(
                 "net/minecraft/client/renderer/texture/SkinTextureDownloader.class"));
         patchUtilJarFileSystem(args[0], root.resolve("net/minecraft/util/Util.class"));
@@ -19014,16 +19016,17 @@ public final class MinecraftClientPatcher {
                         "(Ljava/net/URL;)Ljava/net/URL;",
                         false));
                 code.add(new VarInsnNode(Opcodes.ASTORE, 1));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 1));
                 code.add(new VarInsnNode(Opcodes.ALOAD, 2));
                 code.add(new MethodInsnNode(
                         Opcodes.INVOKESTATIC,
                         "dev/gaius/browser/BrowserHttpProxy",
-                        "browserSafeHeaders",
-                        "(Ljava/util/Map;)Ljava/util/Map;",
+                        "browserSafeResourcePackHeaders",
+                        "(Ljava/net/URL;Ljava/util/Map;)Ljava/util/Map;",
                         false));
                 code.add(new VarInsnNode(Opcodes.ASTORE, 2));
                 method.instructions.insert(code);
-                method.maxStack = Math.max(method.maxStack, 1);
+                method.maxStack = Math.max(method.maxStack, 2);
                 for (var instruction = method.instructions.getFirst();
                         instruction != null;
                         instruction = instruction.getNext()) {
@@ -19045,6 +19048,44 @@ public final class MinecraftClientPatcher {
             throw new IllegalStateException(
                     "HttpUtil browser download patch points were not found: method="
                             + patchedDownload + " proxy=" + removedJavaProxy);
+        }
+        write(node, output);
+    }
+
+    /**
+     * TeaVM's browser class library does not provide a background thread for the vanilla
+     * resource-pack queue.  DownloadQueue otherwise submits its CompletableFuture supplier to
+     * a ConsecutiveExecutor backed by Util.nonCriticalIoPool(); that executor can remain pending
+     * forever in the browser, so HttpUtil.downloadFile (and the browser resource-pack proxy) is
+     * never reached.  Keep the vanilla queue/future semantics, but run its executor through the
+     * cooperative browser pump.  The helper bypasses itself in the integrated-server Worker.
+     */
+    private static void patchDownloadQueueBrowser(String jar, Path output) throws IOException {
+        String owner = "net/minecraft/server/packs/DownloadQueue";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode constructor = find(node, "<init>", "(Ljava/nio/file/Path;)V");
+        int patched = 0;
+        for (AbstractInsnNode instruction = constructor.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKESTATIC
+                    || !call.owner.equals("net/minecraft/util/Util")
+                    || !call.name.equals("nonCriticalIoPool")
+                    || !call.desc.equals("()Lnet/minecraft/TracingExecutor;")) {
+                continue;
+            }
+            constructor.instructions.insert(call, new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserCooperativeExecutor",
+                    "defer",
+                    "(Ljava/util/concurrent/Executor;)Ljava/util/concurrent/Executor;",
+                    false));
+            patched++;
+        }
+        if (patched != 1) {
+            throw new IllegalStateException(
+                    "DownloadQueue browser executor patch point changed: " + patched);
         }
         write(node, output);
     }

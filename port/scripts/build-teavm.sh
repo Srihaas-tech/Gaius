@@ -96,21 +96,41 @@ overlay_lock_owner="$GAIUS_TEA_LOCK_OWNER_TOKEN"
 if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
     GAIUS_OVERLAY_DIRECTORY="$overlay_directory" \
       GAIUS_OVERLAY_LOCK_HELD=true "$root/port/scripts/build-overlays.sh" >/dev/null
-  gson_type_token_patches="$build_root/gson-type-token-client-patches"
-  mkdir -p "$gson_type_token_patches"
-  find "$gson_type_token_patches" -type f -delete
-  java -classpath \
-    "$overlay_directory/tool-classes:$maven_repository/org/ow2/asm/asm/9.8/asm-9.8.jar:$maven_repository/org/ow2/asm/asm-tree/9.8/asm-tree-9.8.jar" \
-    dev.gaius.tools.GsonTypeTokenClientPatcher \
-    "$overlay_directory/client-named-$version-gaius.jar" \
-    "$gson_type_token_patches" \
-    "$work/libraries"
-  jar --update \
-    --file "$overlay_directory/client-named-$version-gaius.jar" \
-    -C "$gson_type_token_patches" .
 else
   echo "Skipping overlay rebuild because GAIUS_SKIP_OVERLAY_BUILD=true"
+  # A resumed build may reuse an overlay JAR that an earlier pass already
+  # postprocessed.  Refresh the patch tools from the current source even when
+  # the expensive overlay rebuild is skipped; otherwise a stale non-idempotent
+  # patcher class can reject that valid, already-rewritten JAR.
+  tool_classes="$overlay_directory/tool-classes"
+  asm_version="9.8"
+  tool_compile_classpath="$maven_repository/org/ow2/asm/asm/$asm_version/asm-$asm_version.jar:$maven_repository/org/ow2/asm/asm-tree/$asm_version/asm-tree-$asm_version.jar"
+  if command -v cygpath >/dev/null 2>&1; then
+    tool_compile_classpath="$maven_repository_for_java/org/ow2/asm/asm/$asm_version/asm-$asm_version.jar;$maven_repository_for_java/org/ow2/asm/asm-tree/$asm_version/asm-tree-$asm_version.jar"
+  fi
+  mkdir -p "$tool_classes"
+  find "$tool_classes" -type f -delete
+  javac --release 21 -proc:none \
+    -classpath "$tool_compile_classpath" \
+    -d "$tool_classes" \
+    "$root/port/tools/src/main/java/dev/gaius/tools/"*.java
 fi
+# Gson/Guava TypeToken portability patches are client-overlay postprocessing,
+# not part of regenerating the base overlays.  Always refresh and apply them
+# while the overlay writer lock is held so resume/release builds with
+# GAIUS_SKIP_OVERLAY_BUILD=true cannot consume a stale unpatched client JAR.
+gson_type_token_patches="$build_root/gson-type-token-client-patches"
+mkdir -p "$gson_type_token_patches"
+find "$gson_type_token_patches" -type f -delete
+java -classpath \
+  "$overlay_directory/tool-classes:$maven_repository/org/ow2/asm/asm/9.8/asm-9.8.jar:$maven_repository/org/ow2/asm/asm-tree/9.8/asm-tree-9.8.jar" \
+  dev.gaius.tools.GsonTypeTokenClientPatcher \
+  "$overlay_directory/client-named-$version-gaius.jar" \
+  "$gson_type_token_patches" \
+  "$work/libraries"
+jar --update \
+  --file "$overlay_directory/client-named-$version-gaius.jar" \
+  -C "$gson_type_token_patches" .
 node "$root/port/scripts/gson-type-token-smoke.mjs" \
   --profile "$GAIUS_VERSION_PROFILE" \
   --overlay "$overlay_directory"
