@@ -1,141 +1,272 @@
 [CmdletBinding()]
 param(
-    [string]$EvidencePath,
+    [Parameter(Mandatory = $true)][string]$EvidencePath,
     [string]$Stage = 'port/target/release-v0.1.0-final-20260913',
+    [string]$Repo = 'TypeThe0ry/Gaius',
+    [int]$PagesTimeoutSeconds = 1200,
+    [int]$PagesPollSeconds = 10,
+    [int]$PagesVerifierTimeoutSeconds = 180,
+    [string]$PagesEvidence = 'artifacts/github-pages-cdp-release-final.json',
     [switch]$ExecuteUpload
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-
-$root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 Set-Location -LiteralPath $root
-
-$stagePath = (Resolve-Path (Join-Path $root $Stage)).Path
+$tag = 'v0.1.0'
 $requiredAssets = @(
-    'Gaius-1.21.11.html',
-    'Gaius-1.21.11.manifest.json',
-    'Gaius-26.2.html',
-    'Gaius-26.2.manifest.json',
-    'gaius-server-plugin-0.1.0.jar',
-    'RELEASE-NOTES.md',
-    'release.manifest.json',
-    'SHA256SUMS'
+    'Gaius-1.21.11.html', 'Gaius-1.21.11.manifest.json',
+    'Gaius-26.2.html', 'Gaius-26.2.manifest.json',
+    'gaius-server-plugin-0.1.0.jar', 'RELEASE-NOTES.md',
+    'release.manifest.json', 'SHA256SUMS'
 )
 
-function Fail([string]$Message) { throw "FINAL RELEASE GATE: $Message" }
-
-if (-not (Test-Path -LiteralPath $stagePath -PathType Container)) {
-    Fail "release stage does not exist: $stagePath"
+function Fail([string]$Message) { throw "FINAL RELEASE PUBLISH: $Message" }
+if ($PagesTimeoutSeconds -lt 1) { Fail 'PagesTimeoutSeconds must be >= 1' }
+if ($PagesPollSeconds -lt 1) { Fail 'PagesPollSeconds must be >= 1' }
+if ($PagesVerifierTimeoutSeconds -lt 1 -or $PagesVerifierTimeoutSeconds -gt 2147483) {
+    Fail 'PagesVerifierTimeoutSeconds must be between 1 and 2147483'
+}
+function Assert-ExactAssets([string]$Directory) {
+    $actual = @(Get-ChildItem -LiteralPath $Directory -Force -File | ForEach-Object Name | Sort-Object)
+    $expected = @($requiredAssets | Sort-Object)
+    if (($actual -join "`n") -ne ($expected -join "`n")) {
+        Fail "stage is not exact-eight (actual=$($actual -join ', '); expected=$($expected -join ', '))"
+    }
+    if (@(Get-ChildItem -LiteralPath $Directory -Force -Directory).Count -ne 0) { Fail 'stage contains unexpected directories' }
+}
+function Assert-TagUnchanged([string]$ExpectedObject, [string]$Label) {
+    $local = (git rev-parse --verify "refs/tags/$tag").Trim()
+    if ($local -ne $ExpectedObject) { Fail "$Label changed local tag ref ($local != $ExpectedObject)" }
+    $remoteLine = @(git ls-remote --tags origin "refs/tags/$tag")
+    if ($LASTEXITCODE -ne 0 -or $remoteLine.Count -ne 1) { Fail "$Label could not verify remote tag ref" }
+    $remote = ([string]$remoteLine[0] -split "`t")[0]
+    if ($remote -ne $ExpectedObject) { Fail "$Label changed/mismatched remote tag ref ($remote != $ExpectedObject)" }
+}
+function Get-PagesRuns {
+    $json = & gh run list --repo $Repo --workflow pages.yml --event workflow_dispatch --limit 50 `
+        --json databaseId,displayTitle,headSha,event,status,conclusion,createdAt,startedAt,url
+    if ($LASTEXITCODE -ne 0) { Fail 'could not list GitHub Pages workflow runs' }
+    try { @($json | ConvertFrom-Json) }
+    catch { Fail "gh run list returned invalid JSON: $($_.Exception.Message)" }
 }
 
-$missing = @($requiredAssets | Where-Object { -not (Test-Path -LiteralPath (Join-Path $stagePath $_) -PathType Leaf) })
-if ($missing.Count -ne 0) { Fail "stage is incomplete: $($missing -join ', ')" }
+$stagePath = if ([IO.Path]::IsPathRooted($Stage)) { [IO.Path]::GetFullPath($Stage) } else { [IO.Path]::GetFullPath((Join-Path $root $Stage)) }
+$targetRoot = [IO.Path]::GetFullPath((Join-Path $root 'port/target')).TrimEnd('\', '/')
+if (-not $stagePath.StartsWith($targetRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+    Fail "stage must be below port/target: $stagePath"
+}
+if (-not (Test-Path -LiteralPath $stagePath -PathType Container)) { Fail "stage does not exist: $stagePath" }
+Assert-ExactAssets $stagePath
+foreach ($name in $requiredAssets) {
+    if ((Get-Item -LiteralPath (Join-Path $stagePath $name)).Length -le 0) { Fail "empty stage asset: $name" }
+}
 
+try { $manifest = Get-Content -LiteralPath (Join-Path $stagePath 'release.manifest.json') -Raw | ConvertFrom-Json }
+catch { Fail "release.manifest.json is invalid JSON: $($_.Exception.Message)" }
 $head = (git rev-parse --verify HEAD).Trim()
-$manifestPath = Join-Path $stagePath 'release.manifest.json'
-$manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-if ($manifest.tag -ne 'v0.1.0') { Fail "unexpected manifest tag: $($manifest.tag)" }
-if ($manifest.sourceHead -ne $head) {
-    Fail "manifest sourceHead $($manifest.sourceHead) does not match HEAD $head"
+if ($manifest.schemaVersion -ne 3 -or $manifest.tag -ne $tag -or $manifest.sourceHead -ne $head -or
+    $manifest.artifactBuildReason -ne 'rebuilt-from-final-main') {
+    Fail "release manifest is stale or invalid for HEAD $head"
 }
-if ($manifest.artifactBuildReason -ne 'rebuilt-from-final-main') {
-    Fail "artifactBuildReason is not rebuilt-from-final-main"
+if ($manifest.relay.target -ne 't40.sjcmc.cn:14803' -or $manifest.relay.url -ne 'wss://ellan.site/tunnel' -or
+    $manifest.relay.strictTerrainGate -ne 'passed' -or $manifest.acceptanceEvidence.'26.2.multiplayer'.status -ne 'passed') {
+    Fail 'release manifest strict multiplayer gate is not passed'
+}
+
+$resolvedEvidence = if ([IO.Path]::IsPathRooted($EvidencePath)) { [IO.Path]::GetFullPath($EvidencePath) } else { [IO.Path]::GetFullPath((Join-Path $root $EvidencePath)) }
+if (-not (Test-Path -LiteralPath $resolvedEvidence -PathType Leaf)) { Fail "multiplayer evidence is missing: $resolvedEvidence" }
+$evidenceIdentity = [pscustomobject]@{
+    bytes = [long](Get-Item -LiteralPath $resolvedEvidence).Length
+    sha256 = (Get-FileHash -LiteralPath $resolvedEvidence -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+$declaredEvidence = $manifest.acceptanceEvidence.'26.2.multiplayer'
+if ($declaredEvidence.file -ne [IO.Path]::GetFileName($resolvedEvidence) -or
+    [long]$declaredEvidence.identity.bytes -ne $evidenceIdentity.bytes -or
+    [string]$declaredEvidence.identity.sha256 -ne $evidenceIdentity.sha256) {
+    Fail 'supplied multiplayer evidence does not match the prepared release manifest'
+}
+$priorTarget = $env:TARGET; $priorRelay = $env:RELAY; $priorArtifact = $env:ARTIFACT
+try {
+    $env:TARGET = 't40.sjcmc.cn:14803'
+    $env:RELAY = 'wss://ellan.site/tunnel'
+    $env:ARTIFACT = Join-Path $stagePath 'Gaius-26.2.html'
+    & node (Join-Path $root 'tools/check-multiplayer-terrain-evidence.mjs') $resolvedEvidence | Out-Host
+    if ($LASTEXITCODE -ne 0) { Fail 'tracked multiplayer evidence revalidation failed' }
+} finally {
+    if ($null -eq $priorTarget) { Remove-Item Env:TARGET -ErrorAction SilentlyContinue } else { $env:TARGET = $priorTarget }
+    if ($null -eq $priorRelay) { Remove-Item Env:RELAY -ErrorAction SilentlyContinue } else { $env:RELAY = $priorRelay }
+    if ($null -eq $priorArtifact) { Remove-Item Env:ARTIFACT -ErrorAction SilentlyContinue } else { $env:ARTIFACT = $priorArtifact }
 }
 
 $sumBytes = [IO.File]::ReadAllBytes((Join-Path $stagePath 'SHA256SUMS'))
-if (@($sumBytes | Where-Object { $_ -eq 13 }).Count -ne 0) {
-    Fail 'SHA256SUMS contains CR bytes; regenerate with LF-only records'
+if (@($sumBytes | Where-Object { $_ -eq 13 }).Count -ne 0) { Fail 'SHA256SUMS contains CR bytes' }
+$sumNames = @()
+foreach ($line in ([Text.Encoding]::ASCII.GetString($sumBytes) -split "`n" | Where-Object { $_ -ne '' })) {
+    if ($line -notmatch '^([0-9a-f]{64})  ([^/\\]+)$') { Fail "invalid SHA256SUMS record: $line" }
+    $expected = (Get-FileHash -LiteralPath (Join-Path $stagePath $Matches[2]) -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($expected -ne $Matches[1]) { Fail "checksum mismatch: $($Matches[2])" }
+    $sumNames += $Matches[2]
 }
-& 'C:\Program Files\Git\bin\bash.exe' -lc "cd '$($stagePath -replace '\\','/')' && sha256sum -c SHA256SUMS"
-if ($LASTEXITCODE -ne 0) { Fail 'staged SHA256SUMS verification failed' }
-
-if ([string]::IsNullOrWhiteSpace($EvidencePath)) {
-    $candidates = @(Get-ChildItem -LiteralPath (Join-Path $root 'artifacts') -Filter 'join-terrain-*.json' -File |
-        Sort-Object LastWriteTime -Descending)
-    if ($candidates.Count -eq 0) { Fail 'no multiplayer evidence supplied; pass -EvidencePath explicitly' }
-    $EvidencePath = $candidates[0].FullName
-} elseif (-not [IO.Path]::IsPathRooted($EvidencePath)) {
-    $EvidencePath = Join-Path $root $EvidencePath
-}
-if (-not (Test-Path -LiteralPath $EvidencePath -PathType Leaf)) {
-    Fail "multiplayer evidence not found: $EvidencePath"
+$expectedSumNames = @($requiredAssets | Where-Object { $_ -ne 'SHA256SUMS' } | Sort-Object)
+if ((@($sumNames | Sort-Object) -join "`n") -ne ($expectedSumNames -join "`n")) {
+    Fail 'SHA256SUMS does not cover exactly the seven non-sum assets'
 }
 
-$evidence = Get-Content -LiteralPath $EvidencePath -Raw | ConvertFrom-Json
-if ($evidence.success -ne $true) { Fail 'multiplayer runner did not report success=true' }
-if ($null -eq $evidence.final) { Fail 'multiplayer evidence has no final snapshot' }
-$state = $evidence.final.state
-$bridge = $evidence.final.bridgeStats
-if ($null -eq $state -or $null -eq $bridge) { Fail 'multiplayer evidence is missing final.state or final.bridgeStats' }
-if ($state.level -ne 'net.minecraft.client.multiplayer.ClientLevel') {
-    Fail "multiplayer level is not ClientLevel: $($state.level)"
-}
-if ([int]$state.loadedChunkCount -le 0) {
-    Fail "loadedChunkCount=$($state.loadedChunkCount); real terrain is not loaded"
-}
-if ([int]$bridge.relayNodeSuccesses -lt 1) { Fail 'no successful RelayNode connection recorded' }
-if ([int]$bridge.relayTargetAttestationFailures -ne 0) { Fail 'RelayNode target attestation failures present' }
-if ([int]$bridge.errors -ne 0) { Fail "RelayNode bridge errors=$($bridge.errors)" }
-if ([int]$bridge.connected -lt 1) { Fail 'RelayNode connected count is zero' }
-if ($evidence.logs -and $evidence.logs.exceptions -and @($evidence.logs.exceptions).Count -ne 0) {
-    Fail "browser/runtime exceptions present: $(@($evidence.logs.exceptions).Count)"
-}
+if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { Fail 'GitHub CLI (gh) is required' }
+$localTagObject = (git rev-parse --verify "refs/tags/$tag").Trim()
+Assert-TagUnchanged $localTagObject 'pre-upload'
+$remoteMainLine = @(git ls-remote origin 'refs/heads/main')
+if ($LASTEXITCODE -ne 0 -or $remoteMainLine.Count -ne 1) { Fail 'could not verify origin/main' }
+$remoteMain = ([string]$remoteMainLine[0] -split "`t")[0]
+if ($remoteMain -ne $head) { Fail "origin/main must equal release sourceHead before publish ($remoteMain != $head)" }
+$releaseJson = gh release view $tag --repo $Repo --json tagName,isDraft,isPrerelease,assets
+if ($LASTEXITCODE -ne 0) { Fail "release does not exist: $Repo $tag" }
+try { $release = $releaseJson | ConvertFrom-Json }
+catch { Fail "gh release view returned invalid JSON: $($_.Exception.Message)" }
+if ($release.tagName -ne $tag) { Fail "release tag mismatch: $($release.tagName)" }
 
-$terrainScreenshots = @($evidence.screenshots | Where-Object { $_ -match '(?i)terrain|world|game' })
-if ($terrainScreenshots.Count -eq 0) { Fail 'evidence has no terrain/world screenshot path' }
-$evidenceDir = (Resolve-Path -LiteralPath $EvidencePath).Path | Split-Path -Parent
-$resolvedScreenshots = @()
-foreach ($shot in $terrainScreenshots) {
-    $candidate = if ([IO.Path]::IsPathRooted([string]$shot)) { [string]$shot } else { Join-Path $evidenceDir ([string]$shot) }
-    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf) -and -not [IO.Path]::IsPathRooted([string]$shot)) {
-        $candidate = Join-Path $root ([string]$shot)
-    }
-    if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-        if ((Get-Item -LiteralPath $candidate).Length -gt 0) { $resolvedScreenshots += (Resolve-Path -LiteralPath $candidate).Path }
-    }
-}
-if ($resolvedScreenshots.Count -eq 0) { Fail 'terrain/world screenshot paths do not resolve to non-empty files' }
-
-Write-Host "Multiplayer strict gate PASS: $EvidencePath" -ForegroundColor Green
-Write-Host "  level=$($state.level) loadedChunkCount=$($state.loadedChunkCount)"
-Write-Host "  relaySuccesses=$($bridge.relayNodeSuccesses) attestationFailures=$($bridge.relayTargetAttestationFailures) errors=$($bridge.errors)"
-Write-Host "  terrainScreenshots=$($resolvedScreenshots -join '; ')"
-
+Write-Host "Final release gate PASS (dry-run): exactAssets=8 sourceHead=$head tagObject=$localTagObject" -ForegroundColor Green
 if (-not $ExecuteUpload) {
-    Write-Host 'Preparation only: no release upload, tag mutation, or Pages dispatch performed.' -ForegroundColor Yellow
-    Write-Host 'Re-run with -ExecuteUpload after reviewing the strict gate output.' -ForegroundColor Yellow
+    Write-Host 'No upload, release deletion, tag/ref mutation, or Pages dispatch was performed.' -ForegroundColor Yellow
     exit 0
 }
 
-# Only after the strict multiplayer gate passes do we replace the staged
-# acceptance marker and recompute checksums. The v0.1.0 tag is never moved.
-$manifest.acceptanceEvidence.multiplayer = (Resolve-Path -LiteralPath $EvidencePath).Path.Replace('\\','/')
-$manifest.acceptanceEvidence.multiplayerStatus = 'passed'
-$manifest.relay.publicStrictLatencyGate = 'passed'
-$manifest.generatedAt = (Get-Date).ToUniversalTime().ToString('o')
-$manifest | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $manifestPath -Encoding utf8
-
-$notesPath = Join-Path $stagePath 'RELEASE-NOTES.md'
-$notes = Get-Content -LiteralPath $notesPath -Raw
-$notes = $notes -replace 'The currently deployed public RelayNode strict latency gate remains open and is not represented as passed by this release\.', 'The public RelayNode strict multiplayer acceptance gate passed in real Chrome/CDP and is recorded in release.manifest.json.'
-if ($notes -notmatch 'public RelayNode strict multiplayer acceptance gate passed') {
-    $notes += "`r`n`r`nMultiplayer strict acceptance: PASS ($([IO.Path]::GetFileName($EvidencePath))).`r`n"
+# Remove only unexpected extras before upload, then clobber the exact eight
+# expected names. No command in this script creates, edits, or moves a tag.
+foreach ($asset in @($release.assets | Where-Object { $_.name -notin $requiredAssets })) {
+    & gh release delete-asset $tag $asset.name --repo $Repo --yes
+    if ($LASTEXITCODE -ne 0) { Fail "failed to delete unexpected release asset: $($asset.name)" }
 }
-Set-Content -LiteralPath $notesPath -Value $notes -Encoding utf8
+Assert-TagUnchanged $localTagObject 'after extra-asset cleanup'
+$uploadPaths = @($requiredAssets | ForEach-Object { Join-Path $stagePath $_ })
+& gh release upload $tag --repo $Repo @uploadPaths --clobber
+if ($LASTEXITCODE -ne 0) { Fail 'exact-eight release upload failed' }
+Assert-TagUnchanged $localTagObject 'after upload'
 
-$hashLines = foreach ($file in Get-ChildItem -LiteralPath $stagePath -File | Where-Object { $_.Name -ne 'SHA256SUMS' } | Sort-Object Name) {
-    "$( (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant() )  $($file.Name)"
+& gh release edit $tag --repo $Repo --title 'Gaius Client 0.1.0' `
+    --notes-file (Join-Path $stagePath 'RELEASE-NOTES.md') --latest
+if ($LASTEXITCODE -ne 0) { Fail 'release notes/title update failed' }
+Assert-TagUnchanged $localTagObject 'after release metadata update'
+
+$remote = gh release view $tag --repo $Repo --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
+$remoteNames = @($remote.assets | ForEach-Object name | Sort-Object)
+if (($remoteNames -join "`n") -ne (@($requiredAssets | Sort-Object) -join "`n")) {
+    Fail "post-upload remote asset set is not exact-eight: $($remoteNames -join ', ')"
 }
-$ascii = [Text.Encoding]::ASCII
-[IO.File]::WriteAllText((Join-Path $stagePath 'SHA256SUMS'), (($hashLines -join "`n") + "`n"), $ascii)
+if ($remote.isDraft -eq $true -or $remote.isPrerelease -eq $true) { Fail 'v0.1.0 is not a final published release' }
 
-$pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
-$shell = if ($pwsh) { $pwsh.Source } else { (Get-Command powershell -ErrorAction Stop).Source }
-& $shell -NoProfile -File (Join-Path $root 'port/target/release-v0.1.0-final-20260913-clobber.ps1')
-if ($LASTEXITCODE -ne 0) { Fail 'release clobber script failed' }
+& (Join-Path $root 'tools/fresh-download-verify-v0.1.0.ps1') -Repo $Repo -Tag $tag -ExpectedSourceHead $head
+if ($LASTEXITCODE -ne 0) { Fail 'tracked fresh-download verifier failed' }
+Assert-TagUnchanged $localTagObject 'after fresh verification'
 
-& $shell -NoProfile -File (Join-Path $root 'port/target/release-v0.1.0-fresh-download-verify.ps1')
-if ($LASTEXITCODE -ne 0) { Fail 'fresh-download verification failed' }
+# Pages dispatch happens only after the remote exact-eight/fresh-download gate.
+$pagesReleaseToken = [Guid]::NewGuid().ToString('N')
+$expectedPagesTitle = "Deploy Gaius Pages [$pagesReleaseToken]"
+$beforePagesRuns = @(Get-PagesRuns)
+Assert-TagUnchanged $localTagObject 'after pre-dispatch Pages run inventory'
+$beforePagesIds = @{}
+foreach ($run in $beforePagesRuns) { $beforePagesIds[[string]$run.databaseId] = $true }
+$pagesDispatchNotBefore = (Get-Date).ToUniversalTime().AddMinutes(-1)
+& gh workflow run pages.yml --repo $Repo --ref main -f "release_token=$pagesReleaseToken"
+if ($LASTEXITCODE -ne 0) { Fail 'GitHub Pages workflow dispatch failed' }
+Assert-TagUnchanged $localTagObject 'after Pages dispatch'
 
-Write-Host 'FINAL RELEASE v0.1.0 upload + fresh-download + Pages dispatch completed.' -ForegroundColor Green
+$pagesRun = $null
+$pagesDeadline = (Get-Date).AddSeconds($PagesTimeoutSeconds)
+while ((Get-Date) -lt $pagesDeadline -and $null -eq $pagesRun) {
+    $runs = @(Get-PagesRuns)
+    Assert-TagUnchanged $localTagObject 'during Pages dispatch run discovery'
+    $candidates = @($runs | Where-Object {
+        -not $beforePagesIds.ContainsKey([string]$_.databaseId) -and
+        $_.event -eq 'workflow_dispatch' -and $_.headSha -eq $head -and
+        $_.displayTitle -eq $expectedPagesTitle -and
+        [DateTimeOffset]$_.createdAt -ge $pagesDispatchNotBefore
+    } | Sort-Object createdAt, databaseId)
+    if ($candidates.Count -gt 1) {
+        Fail "ambiguous Pages dispatch association for $head (newRuns=$($candidates.databaseId -join ', '))"
+    }
+    if ($candidates.Count -eq 1) { $pagesRun = $candidates[0] }
+    if ($null -eq $pagesRun) { Start-Sleep -Seconds $PagesPollSeconds }
+}
+if ($null -eq $pagesRun) { Fail "timed out associating Pages token $pagesReleaseToken for $head" }
+Write-Host "Associated Pages run: $($pagesRun.databaseId) token=$pagesReleaseToken $($pagesRun.url)" -ForegroundColor Cyan
+
+$pagesDeadline = (Get-Date).AddSeconds($PagesTimeoutSeconds)
+while ((Get-Date) -lt $pagesDeadline) {
+    $viewJson = & gh run view ([string]$pagesRun.databaseId) --repo $Repo `
+        --json databaseId,displayTitle,headSha,event,status,conclusion,createdAt,startedAt,url
+    if ($LASTEXITCODE -ne 0) { Fail "could not inspect Pages run $($pagesRun.databaseId)" }
+    Assert-TagUnchanged $localTagObject 'during Pages run wait'
+    try { $pagesRun = $viewJson | ConvertFrom-Json }
+    catch { Fail "gh run view returned invalid JSON: $($_.Exception.Message)" }
+    if ($pagesRun.headSha -ne $head -or $pagesRun.event -ne 'workflow_dispatch' -or
+        $pagesRun.displayTitle -ne $expectedPagesTitle -or
+        [DateTimeOffset]$pagesRun.createdAt -lt $pagesDispatchNotBefore) {
+        Fail "associated Pages run identity changed: $($pagesRun.databaseId)"
+    }
+    if ($pagesRun.status -eq 'completed') { break }
+    Start-Sleep -Seconds $PagesPollSeconds
+}
+if ($pagesRun.status -ne 'completed') { Fail "timed out waiting for Pages run $($pagesRun.databaseId)" }
+if ($pagesRun.conclusion -ne 'success') { Fail "Pages run $($pagesRun.databaseId) concluded $($pagesRun.conclusion)" }
+Assert-TagUnchanged $localTagObject 'after Pages workflow success'
+
+$pagesVerifier = Join-Path $root 'tools/verify-github-pages-cdp.mjs'
+if (-not (Test-Path -LiteralPath $pagesVerifier -PathType Leaf)) { Fail 'tracked GitHub Pages CDP verifier is missing' }
+$priorOutput = $env:OUTPUT
+$priorProfileRoot = $env:GAIUS_CDP_PROFILE_ROOT
+$pagesVerifierTempRoot = Join-Path ([IO.Path]::GetTempPath()) ("gaius-pages-publish-" + [Guid]::NewGuid().ToString('N'))
+$pagesVerifierStdout = Join-Path $pagesVerifierTempRoot 'stdout.log'
+$pagesVerifierStderr = Join-Path $pagesVerifierTempRoot 'stderr.log'
+$process = $null
+$pagesVerifierTempCleanupFailed = $false
+$pagesVerifierFailure = $null
+try {
+    [void](New-Item -ItemType Directory -Path $pagesVerifierTempRoot -Force)
+    $env:OUTPUT = if ([IO.Path]::IsPathRooted($PagesEvidence)) { $PagesEvidence } else { Join-Path $root $PagesEvidence }
+    $env:GAIUS_CDP_PROFILE_ROOT = $pagesVerifierTempRoot
+    $node = Get-Command node -ErrorAction Stop
+    # Start-Process joins ArgumentList entries into one command line. Preserve
+    # the verifier path as one argv item when the checkout path contains spaces.
+    $quotedPagesVerifier = '"' + $pagesVerifier.Replace('"', '\"') + '"'
+    $process = Start-Process -FilePath $node.Source -ArgumentList @($quotedPagesVerifier) -PassThru `
+        -WindowStyle Hidden -RedirectStandardOutput $pagesVerifierStdout -RedirectStandardError $pagesVerifierStderr
+    if (-not $process.WaitForExit($PagesVerifierTimeoutSeconds * 1000)) {
+        # Kill the complete tree: the verifier owns a Chrome child process.
+        # Killing node alone would orphan Chrome and leave its profile locked.
+        $taskkill = Get-Command taskkill.exe -ErrorAction SilentlyContinue
+        if ($taskkill) {
+            & $taskkill.Source /PID $process.Id /T /F 2>&1 | Out-Null
+        } else {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        }
+        [void]$process.WaitForExit(10000)
+        Get-Content -LiteralPath $pagesVerifierStdout -ErrorAction SilentlyContinue | Out-Host
+        Get-Content -LiteralPath $pagesVerifierStderr -ErrorAction SilentlyContinue | Out-Host
+        Fail "GitHub Pages Chrome/CDP verifier timed out after $PagesVerifierTimeoutSeconds seconds"
+    }
+    Get-Content -LiteralPath $pagesVerifierStdout -ErrorAction SilentlyContinue | Out-Host
+    Get-Content -LiteralPath $pagesVerifierStderr -ErrorAction SilentlyContinue | Out-Host
+    if ($process.ExitCode -ne 0) { Fail "GitHub Pages Chrome/CDP verification failed (exit=$($process.ExitCode))" }
+} catch {
+    $pagesVerifierFailure = $_
+} finally {
+    if ($null -eq $priorOutput) { Remove-Item Env:OUTPUT -ErrorAction SilentlyContinue } else { $env:OUTPUT = $priorOutput }
+    if ($null -eq $priorProfileRoot) { Remove-Item Env:GAIUS_CDP_PROFILE_ROOT -ErrorAction SilentlyContinue } else { $env:GAIUS_CDP_PROFILE_ROOT = $priorProfileRoot }
+    for ($attempt = 0; $attempt -lt 20 -and (Test-Path -LiteralPath $pagesVerifierTempRoot); $attempt++) {
+        Remove-Item -LiteralPath $pagesVerifierTempRoot -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $pagesVerifierTempRoot) { Start-Sleep -Milliseconds 250 }
+    }
+    if (Test-Path -LiteralPath $pagesVerifierTempRoot) {
+        $pagesVerifierTempCleanupFailed = $true
+    }
+}
+if ($pagesVerifierTempCleanupFailed) {
+    $priorFailure = if ($pagesVerifierFailure) { "; priorFailure=$($pagesVerifierFailure.Exception.Message)" } else { '' }
+    Fail "Pages verifier temporary directory cleanup failed: $pagesVerifierTempRoot$priorFailure"
+}
+if ($pagesVerifierFailure) { throw $pagesVerifierFailure }
+Assert-TagUnchanged $localTagObject 'after Pages Chrome/CDP verification'
+Write-Host "FINAL RELEASE v0.1.0 complete: exact-eight, fresh-download, Pages run $($pagesRun.databaseId) token=$pagesReleaseToken, and Pages CDP PASS." -ForegroundColor Green

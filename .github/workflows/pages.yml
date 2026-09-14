@@ -1,4 +1,5 @@
 name: Deploy Gaius GitHub Pages
+run-name: Deploy Gaius Pages [${{ inputs.release_token || github.sha }}]
 
 on:
   push:
@@ -8,6 +9,11 @@ on:
       - relay-nodes.json
       - .github/workflows/pages.yml
   workflow_dispatch:
+    inputs:
+      release_token:
+        description: Unique token binding a release publish to this Pages run
+        required: true
+        type: string
 
 permissions:
   contents: read
