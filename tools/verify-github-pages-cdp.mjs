@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -39,6 +39,107 @@ async function waitForExit(child, timeoutMs) {
     child.once('exit', exited);
     child.once('close', exited);
   });
+}
+
+function cleanupCommandLineMatches(commandLine, profileDir, debugPort) {
+  const command = String(commandLine || '').toLowerCase();
+  const profile = String(profileDir || '').toLowerCase();
+  return Boolean(command && profile && command.includes(profile))
+    || command.includes(`--remote-debugging-port=${debugPort}`);
+}
+
+async function windowsChromeResidues(profileDir, debugPort) {
+  if (process.platform !== 'win32') return [];
+  const script = '$ErrorActionPreference = "Stop"; '
+    + '$profile = $env:GAIUS_CDP_CLEANUP_PROFILE; '
+    + '$needle = "--remote-debugging-port=$env:GAIUS_CDP_CLEANUP_PORT"; '
+    + '@(Get-CimInstance Win32_Process -Filter "Name = \'chrome.exe\'" '
+    + '| Where-Object { $_.CommandLine -and ($_.CommandLine.Contains($profile) -or $_.CommandLine.Contains($needle)) } '
+    + '| Select-Object ProcessId, ParentProcessId, CommandLine) | ConvertTo-Json -Compress';
+  const stdout = await new Promise((resolvePromise, rejectPromise) => {
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script],
+      {
+        windowsHide: true,
+        timeout: 10_000,
+        maxBuffer: 4 * 1024 * 1024,
+        env: {
+          ...process.env,
+          GAIUS_CDP_CLEANUP_PROFILE: profileDir,
+          GAIUS_CDP_CLEANUP_PORT: String(debugPort),
+        },
+      },
+      (error, output) => error ? rejectPromise(error) : resolvePromise(output));
+  });
+  const text = String(stdout || '').trim();
+  if (!text) return [];
+  const parsed = JSON.parse(text);
+  return (Array.isArray(parsed) ? parsed : [parsed]).map((entry) => ({
+    processId: Number(entry.ProcessId),
+    parentProcessId: Number(entry.ParentProcessId),
+    commandLine: String(entry.CommandLine || ''),
+  })).filter((entry) => cleanupCommandLineMatches(entry.commandLine, profileDir, debugPort));
+}
+
+async function waitForNoChromeResidues(profileDir, debugPort, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  let residues = [];
+  do {
+    residues = await windowsChromeResidues(profileDir, debugPort);
+    if (residues.length === 0) return { clean: true, residues: [] };
+    await sleep(250);
+  } while (Date.now() < deadline);
+  return { clean: false, residues };
+}
+
+async function taskkillWindowsTree(processId) {
+  if (process.platform !== 'win32' || !Number.isInteger(processId) || processId <= 0) return false;
+  return await new Promise((resolvePromise) => {
+    execFile('taskkill.exe', ['/PID', String(processId), '/T', '/F'],
+      { windowsHide: true, timeout: 10_000 }, (error) => resolvePromise(!error));
+  });
+}
+
+async function stopChrome(chrome, cdp, profileDir, debugPort) {
+  const cleanup = {
+    browserCloseRequested: false,
+    chromeExited: !chrome,
+    processIdentityClean: true,
+    residues: [],
+    termination: [],
+  };
+  if (cdp && !cdp.closed) {
+    cleanup.browserCloseRequested = true;
+    try {
+      await cdp.send('Browser.close', {}, 3_000);
+      cleanup.termination.push({ step: 'Browser.close', sent: true });
+    } catch (error) {
+      cleanup.termination.push({ step: 'Browser.close', sent: true, error: String(error?.message || error) });
+    }
+  }
+  if (await waitForExit(chrome, 5_000)) {
+    cleanup.termination.push({ step: 'Browser.close/wait', exited: true });
+  } else {
+    const termSent = chrome?.kill('SIGTERM') || false;
+    cleanup.termination.push({ step: 'SIGTERM', sent: termSent });
+    if (!(await waitForExit(chrome, 5_000))) {
+      const killSent = chrome?.kill('SIGKILL') || false;
+      cleanup.termination.push({ step: 'SIGKILL', sent: killSent });
+      await waitForExit(chrome, 5_000);
+    }
+  }
+  let identity = await waitForNoChromeResidues(profileDir, debugPort);
+  if (!identity.clean && process.platform === 'win32') {
+    const killed = [];
+    for (const residue of identity.residues) {
+      killed.push({ processId: residue.processId, sent: await taskkillWindowsTree(residue.processId) });
+    }
+    cleanup.termination.push({ step: 'taskkill-residues', processes: killed });
+    identity = await waitForNoChromeResidues(profileDir, debugPort);
+  }
+  cleanup.processIdentityClean = identity.clean;
+  cleanup.residues = identity.residues;
+  cleanup.chromeExited = (chrome?.exitCode != null || chrome?.signalCode != null) && identity.clean;
+  return cleanup;
 }
 
 async function removeChromeProfile(path) {
@@ -209,16 +310,29 @@ function pagesFinalGate({ checks, error, cleanup }) {
     && checks.every((entry) => entry.ok)
     && cleanup?.cdpClosed === true
     && cleanup?.chromeExited === true
+    && cleanup?.processIdentityClean === true
     && cleanup?.profileRemoved === true;
 }
 
 if (process.argv.includes('--static-self-test')) {
-  const ready = { checks: [{ ok: true }], error: null, cleanup: { cdpClosed: true, chromeExited: true, profileRemoved: true } };
+  const ready = { checks: [{ ok: true }], error: null, cleanup: {
+    cdpClosed: true, chromeExited: true, processIdentityClean: true, profileRemoved: true,
+  } };
   assert.equal(pagesFinalGate(ready), true);
   assert.equal(pagesFinalGate({ ...ready, cleanup: { ...ready.cleanup, cdpClosed: false } }), false);
   assert.equal(pagesFinalGate({ ...ready, cleanup: { chromeExited: false, profileRemoved: true } }), false);
+  assert.equal(pagesFinalGate({ ...ready, cleanup: { ...ready.cleanup, processIdentityClean: false } }), false);
   assert.equal(pagesFinalGate({ ...ready, cleanup: { chromeExited: true, profileRemoved: false } }), false);
   assert.equal(pagesFinalGate({ ...ready, error: 'failure' }), false);
+  assert.equal(cleanupCommandLineMatches(
+    'chrome.exe --user-data-dir=C:\\Temp\\gaius-pages-cdp-ABC',
+    'C:\\Temp\\gaius-pages-cdp-ABC', 9222), true);
+  assert.equal(cleanupCommandLineMatches(
+    'chrome.exe --remote-debugging-port=9222',
+    'C:\\Temp\\gaius-pages-cdp-ABC', 9222), true);
+  assert.equal(cleanupCommandLineMatches(
+    'chrome.exe --remote-debugging-port=9333',
+    'C:\\Temp\\gaius-pages-cdp-ABC', 9222), false);
 
   const exactPack = {
     requestUrl: expectedResourcePack.url,
@@ -285,6 +399,7 @@ if (process.argv.includes('--static-self-test')) {
 let profileDir;
 let chrome;
 let cdp;
+let debugPort;
 let executionError = null;
 const report = {
   schema: 'gaius.github-pages-cdp-acceptance.v1',
@@ -296,7 +411,7 @@ const report = {
 };
 
 try {
-  const debugPort = await freePort();
+  debugPort = await freePort();
   const profileRoot = process.env.GAIUS_CDP_PROFILE_ROOT
     ? resolve(process.env.GAIUS_CDP_PROFILE_ROOT)
     : tmpdir();
@@ -538,6 +653,24 @@ try {
   executionError = String(error?.stack || error);
   report.error = executionError;
 } finally {
+  let chromeCleanup = {
+    browserCloseRequested: false,
+    chromeExited: true,
+    processIdentityClean: true,
+    residues: [],
+    termination: [],
+  };
+  if (chrome) {
+    try {
+      chromeCleanup = await stopChrome(chrome, cdp, profileDir, debugPort);
+    } catch (error) {
+      chromeCleanup.chromeExited = false;
+      chromeCleanup.processIdentityClean = false;
+      chromeCleanup.termination.push({ step: 'stopChrome', error: String(error?.stack || error) });
+      if (!executionError) executionError = String(error?.stack || error);
+      report.error = executionError;
+    }
+  }
   let cdpClosed = true;
   if (cdp) {
     try { cdpClosed = await cdp.close(); }
@@ -547,26 +680,18 @@ try {
       report.error = executionError;
     }
   }
-  let chromeExited = true;
-  if (chrome) {
-    chrome.kill('SIGTERM');
-    chromeExited = await waitForExit(chrome, 5_000);
-    if (!chromeExited) {
-      chrome.kill('SIGKILL');
-      chromeExited = await waitForExit(chrome, 5_000);
-    }
-  }
   const profileCleanup = profileDir
     ? await removeChromeProfile(profileDir)
     : { removed: true, error: null };
   report.cleanup = {
     cdpClosed,
-    chromeExited,
+    ...chromeCleanup,
     profileRemoved: profileCleanup.removed,
     profileError: profileCleanup.error,
   };
   check(report.checks, 'cdp-closed', cdpClosed, `cdpClosed=${cdpClosed}`);
-  check(report.checks, 'chrome-exited', chromeExited, `chromeExited=${chromeExited}`);
+  check(report.checks, 'chrome-exited', chromeCleanup.chromeExited,
+    `chromeExited=${chromeCleanup.chromeExited}; processIdentityClean=${chromeCleanup.processIdentityClean}; residues=${JSON.stringify(chromeCleanup.residues)}`);
   check(report.checks, 'profile-removed', profileCleanup.removed, profileCleanup.error || 'removed');
   report.success = pagesFinalGate({ checks: report.checks, error: executionError, cleanup: report.cleanup });
   report.finishedAt = new Date().toISOString();
