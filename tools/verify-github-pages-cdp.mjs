@@ -11,6 +11,23 @@ const expectedRelay = process.env.RELAY || 'wss://ellan.site/tunnel';
 const expectedTarget = process.env.TARGET || 't40.sjcmc.cn:14803';
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
+async function waitForExit(child, timeoutMs) {
+  if (child.exitCode != null || child.signalCode != null) return true;
+  return await Promise.race([
+    new Promise((done) => child.once('exit', () => done(true))),
+    sleep(timeoutMs).then(() => false),
+  ]);
+}
+
+async function removeChromeProfile(path) {
+  try {
+    await rm(path, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 });
+  } catch (error) {
+    if (!['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(error?.code)) throw error;
+    console.warn(`Chrome profile cleanup deferred: ${error.message}`);
+  }
+}
+
 async function freePort() {
   const server = createServer();
   await new Promise((done, fail) => {
@@ -113,11 +130,18 @@ try {
     event.exceptionDetails?.exception?.description || event.exceptionDetails?.text || 'runtime exception'));
   await Promise.all([cdp.send('Runtime.enable'), cdp.send('Page.enable'), cdp.send('Network.enable')]);
 
-  const evaluate = async (expression) => (await cdp.send('Runtime.evaluate', {
-    expression,
-    returnByValue: true,
-    awaitPromise: true,
-  })).result?.value;
+  const evaluate = async (expression) => {
+    const response = await cdp.send('Runtime.evaluate', {
+      expression,
+      returnByValue: true,
+      awaitPromise: true,
+    });
+    if (response.exceptionDetails) {
+      throw new Error(response.exceptionDetails.exception?.description
+        || response.exceptionDetails.text || 'Runtime.evaluate failed');
+    }
+    return response.result?.value;
+  };
 
   for (const path of ['', '1.21.11/', '26.2/']) {
     const url = new URL(path, base).href;
@@ -180,9 +204,20 @@ try {
   await writeFile(output, `${JSON.stringify(report, null, 2)}\n`);
   console.log(JSON.stringify({ output, success: report.success, checks: report.checks }, null, 2));
   if (!report.success) process.exitCode = 1;
+} catch (error) {
+  report.success = false;
+  report.error = String(error?.stack || error);
+  report.finishedAt = new Date().toISOString();
+  await mkdir(dirname(output), { recursive: true });
+  await writeFile(output, `${JSON.stringify(report, null, 2)}\n`);
+  console.error(report.error);
+  process.exitCode = 1;
 } finally {
   cdp?.close();
-  chrome.kill();
-  await sleep(500);
-  await rm(profileDir, { recursive: true, force: true }).catch(() => {});
+  chrome.kill('SIGTERM');
+  if (!(await waitForExit(chrome, 5_000))) {
+    chrome.kill('SIGKILL');
+    await waitForExit(chrome, 5_000);
+  }
+  await removeChromeProfile(profileDir);
 }
