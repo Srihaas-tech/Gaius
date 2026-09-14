@@ -19016,16 +19016,17 @@ public final class MinecraftClientPatcher {
                         "(Ljava/net/URL;)Ljava/net/URL;",
                         false));
                 code.add(new VarInsnNode(Opcodes.ASTORE, 1));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 1));
                 code.add(new VarInsnNode(Opcodes.ALOAD, 2));
                 code.add(new MethodInsnNode(
                         Opcodes.INVOKESTATIC,
                         "dev/gaius/browser/BrowserHttpProxy",
-                        "browserSafeHeaders",
-                        "(Ljava/util/Map;)Ljava/util/Map;",
+                        "browserSafeResourcePackHeaders",
+                        "(Ljava/net/URL;Ljava/util/Map;)Ljava/util/Map;",
                         false));
                 code.add(new VarInsnNode(Opcodes.ASTORE, 2));
                 method.instructions.insert(code);
-                method.maxStack = Math.max(method.maxStack, 1);
+                method.maxStack = Math.max(method.maxStack, 2);
                 for (var instruction = method.instructions.getFirst();
                         instruction != null;
                         instruction = instruction.getNext()) {

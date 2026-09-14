@@ -2136,6 +2136,14 @@ public final class PlatformSmoke {
                 || !resourcePackUrl.contains("packs.example.invalid")) {
             throw new AssertionError("Browser resource-pack proxy URL is invalid");
         }
+        URL pinnedResourcePack = BrowserHttpProxy.proxyResourcePack(new URL(
+                "https://jihulab.com/-/project/356228/uploads/"
+                        + "e409655d230380173547e68c5ef026d4/resource_pack.zip"));
+        if (!"https://typethe0ry.github.io/Gaius/resource-packs/"
+                .concat("008381d7a89976709aa86bb71dee06dc50bb3961.zip")
+                .equals(pinnedResourcePack.toExternalForm())) {
+            throw new AssertionError("Pinned browser resource-pack mirror is invalid");
+        }
         URL authentication = BrowserHttpProxy.proxyAuthentication(
                 new URL("https://sessionserver.mojang.com/session/minecraft/join"));
         String authenticationUrl = authentication.toExternalForm();
@@ -2162,6 +2170,17 @@ public final class PlatformSmoke {
         if (headers.containsKey("User-Agent") || headers.containsKey("Host")
                 || !"1.21.11".equals(headers.get("X-Minecraft-Version"))) {
             throw new AssertionError("Browser HTTP forbidden-header filtering is invalid");
+        }
+        Map<String, String> mirrorHeaders = BrowserHttpProxy.browserSafeResourcePackHeaders(
+                pinnedResourcePack,
+                Map.of(
+                        "Accept", "application/octet-stream",
+                        "X-Minecraft-Version", "1.21.11",
+                        "X-Minecraft-UUID", "00000000-0000-0000-0000-000000000000"));
+        if (!"application/octet-stream".equals(mirrorHeaders.get("Accept"))
+                || mirrorHeaders.containsKey("X-Minecraft-Version")
+                || mirrorHeaders.containsKey("X-Minecraft-UUID")) {
+            throw new AssertionError("Pinned resource-pack mirror headers are not CORS-simple");
         }
     }
 

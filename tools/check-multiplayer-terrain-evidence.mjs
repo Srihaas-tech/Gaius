@@ -11,6 +11,14 @@ import {
   terrainVisualPass,
 } from './terrain-visual-metrics.mjs';
 
+const expectedResourcePack = Object.freeze({
+  originalUrl: 'https://jihulab.com/-/project/356228/uploads/e409655d230380173547e68c5ef026d4/resource_pack.zip',
+  fixedMirrorUrl: 'https://typethe0ry.github.io/Gaius/proxy/resource-pack',
+  bytes: 61_102_872,
+  sha1: '008381d7a89976709aa86bb71dee06dc50bb3961',
+  sha256: 'ee96a1fe577a90f1c2a3f686cdec060a3cbf0f127ae8e0585cb79dd93e69e172',
+});
+
 async function hashFile(path) {
   const digest = createHash('sha256');
   let bytes = 0;
@@ -64,6 +72,66 @@ function normalizeRelay(value) {
   } catch {
     return raw.toLowerCase().replace(/\/+$/, '');
   }
+}
+
+function expectedResourcePackProxy(relay) {
+  try {
+    const url = new URL(String(relay || '').trim());
+    if (url.protocol === 'ws:') url.protocol = 'http:';
+    if (url.protocol === 'wss:') url.protocol = 'https:';
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return '';
+    url.pathname = '/proxy/resource-pack';
+    url.hash = '';
+    url.search = '';
+    url.searchParams.set('url', expectedResourcePack.originalUrl);
+    url.searchParams.set('stream', '1');
+    return url.href;
+  } catch {
+    return '';
+  }
+}
+
+function resourcePackUrlMatchesExpected(value, relay) {
+  try {
+    const actual = new URL(String(value || ''));
+    const fixedMirror = new URL(expectedResourcePack.fixedMirrorUrl);
+    if (actual.href === fixedMirror.href) return true;
+    const expected = new URL(expectedResourcePackProxy(relay));
+    const parameterNames = [...new Set(actual.searchParams.keys())].sort();
+    return actual.protocol === expected.protocol
+      && actual.hostname.toLowerCase() === expected.hostname.toLowerCase()
+      && actual.port === expected.port
+      && actual.pathname === expected.pathname
+      && actual.username === ''
+      && actual.password === ''
+      && actual.hash === ''
+      && actual.searchParams.getAll('url').length === 1
+      && actual.searchParams.get('url') === expectedResourcePack.originalUrl
+      && actual.searchParams.getAll('stream').length === 1
+      && actual.searchParams.get('stream') === '1'
+      && actual.searchParams.getAll('token').length <= 1
+      && parameterNames.every((name) => ['stream', 'token', 'url'].includes(name));
+  } catch {
+    return false;
+  }
+}
+
+function verifiedExpectedResourcePackTransaction(entry, relay) {
+  const body = entry?.bodyVerification;
+  return String(entry?.requestId || '').length > 0
+    && entry?.method === 'GET'
+    && resourcePackUrlMatchesExpected(entry.url, relay)
+    && Number(entry.status) >= 200
+    && Number(entry.status) < 300
+    && entry.loadingFinished === true
+    && Number(entry.encodedDataLength) > 0
+    && !entry.loadingFailed
+    && Number(entry.declaredContentLength) === expectedResourcePack.bytes
+    && body?.base64Encoded === true
+    && Number(body?.bytes) === expectedResourcePack.bytes
+    && body?.sha1 === expectedResourcePack.sha1
+    && body?.sha256 === expectedResourcePack.sha256
+    && !body?.error;
 }
 
 function relayNodeSuccesses(bridge, relay) {
@@ -153,14 +221,20 @@ export async function validateEvidence(evidencePath, options = {}) {
     recomputedRelayConnections, expectedTarget, expectedRelay,
   );
   const resourceTransactions = evidence.resourcePack?.transactions || [];
-  const resourceSuccess = resourceTransactions.some((entry) =>
-    Number(entry.status) >= 200
-    && Number(entry.status) < 300
-    && entry.loadingFinished === true
-    && Number(entry.encodedDataLength) > 0
-    && !entry.loadingFailed);
+  const verifiedResourceTransactions = resourceTransactions.filter((entry) =>
+    verifiedExpectedResourcePackTransaction(entry, expectedRelay));
+  const resourceSuccess = verifiedResourceTransactions.length > 0;
+  const declaredResourceRequestIds = Array.isArray(evidence.resourcePack?.successfulRequestIds)
+    ? evidence.resourcePack.successfulRequestIds.map(String).sort()
+    : [];
+  const recomputedResourceRequestIds = verifiedResourceTransactions
+    .map((entry) => String(entry.requestId)).sort();
+  const resourceDeclarationsMatch = JSON.stringify(declaredResourceRequestIds)
+    === JSON.stringify(recomputedResourceRequestIds);
 
   const checks = [
+    gate('runner-schema-v3', evidence.schema === 'gaius.multiplayer-terrain-cdp-acceptance.v3',
+      evidence.schema),
     gate('runner-success', evidence.success === true, evidence.success),
     gate('final-state-present', Boolean(state), state?.screen),
     gate('client-level', state?.level === 'net.minecraft.client.multiplayer.ClientLevel', state?.level),
@@ -180,8 +254,14 @@ export async function validateEvidence(evidencePath, options = {}) {
       (evidence.logs?.evaluateExceptions || []).length),
     gate('cdp-event-errors-clean', (evidence.logs?.cdpEventErrors || []).length === 0,
       (evidence.logs?.cdpEventErrors || []).length),
-    gate('resource-pack-http-complete', evidence.resourcePack?.succeeded === true && resourceSuccess,
-      JSON.stringify(resourceTransactions)),
+    gate('resource-pack-exact-body-verified', evidence.resourcePack?.succeeded === true
+      && resourceSuccess && resourceDeclarationsMatch,
+    JSON.stringify({
+      expected: { ...expectedResourcePack, proxyUrl: expectedResourcePackProxy(expectedRelay) },
+      declaredResourceRequestIds,
+      recomputedResourceRequestIds,
+      transactions: resourceTransactions,
+    })),
     gate('artifact-runner-unchanged', evidence.artifactIdentity?.unchanged === true,
       evidence.artifactIdentity?.unchanged),
     gate('chrome-exited', evidence.cleanup?.chromeExited === true, evidence.cleanup?.chromeExited),
@@ -272,7 +352,7 @@ export async function validateEvidence(evidencePath, options = {}) {
   }
 
   const result = {
-    schema: 'gaius.multiplayer-terrain-evidence-validation.v2',
+    schema: 'gaius.multiplayer-terrain-evidence-validation.v3',
     evidencePath: path,
     expected: { target: expectedTarget, relay: expectedRelay, artifact: expectedArtifact },
     artifact,
@@ -292,6 +372,18 @@ export async function validateEvidence(evidencePath, options = {}) {
 async function runStaticSelfTest() {
   assert.equal(typeof validateEvidence, 'function');
   assert.match(createHash('sha256').update('gaius').digest('hex'), /^[0-9a-f]{64}$/);
+  assert.equal(resourcePackUrlMatchesExpected(
+    expectedResourcePack.fixedMirrorUrl,
+    'wss://relay.example/tunnel'), true);
+  assert.equal(resourcePackUrlMatchesExpected(
+    `${expectedResourcePack.fixedMirrorUrl}?cache-bust=1`,
+    'wss://relay.example/tunnel'), false);
+  assert.equal(resourcePackUrlMatchesExpected(
+    expectedResourcePackProxy('wss://relay.example/tunnel'),
+    'wss://relay.example/tunnel'), true);
+  assert.equal(resourcePackUrlMatchesExpected(
+    expectedResourcePackProxy('wss://wrong.example/tunnel'),
+    'wss://relay.example/tunnel'), false);
   const directory = await mkdtemp(join(tmpdir(), 'gaius-evidence-validator-'));
   try {
     const artifact = join(directory, 'Gaius.html');
@@ -307,6 +399,7 @@ async function runStaticSelfTest() {
     const target = 'example.test:25565';
     const relay = 'wss://relay.example/tunnel';
     const evidence = {
+      schema: 'gaius.multiplayer-terrain-cdp-acceptance.v3',
       success: true,
       artifact,
       artifactIdentity: { path: artifact, ...artifactHash, unchanged: true },
@@ -315,13 +408,17 @@ async function runStaticSelfTest() {
       logs: { exceptions: [], evaluateExceptions: [], cdpEventErrors: [] },
       resourcePack: {
         succeeded: true,
+        successfulRequestIds: ['fixture-pack'],
         transactions: [{
           requestId: 'fixture-pack',
-          url: 'https://relay.example/proxy/resource-pack?stream=1',
+          url: expectedResourcePackProxy(relay),
+          method: 'GET',
           status: 200,
+          declaredContentLength: expectedResourcePack.bytes,
           loadingFinished: true,
-          encodedDataLength: 65_536,
+          encodedDataLength: expectedResourcePack.bytes,
           loadingFailed: null,
+          bodyVerification: { base64Encoded: true, ...expectedResourcePack },
         }],
       },
       cleanup: { chromeExited: true, profileRemoved: true },
@@ -487,7 +584,60 @@ async function runStaticSelfTest() {
       throwOnFailure: false,
     });
     assert.equal(invalid.success, false);
-    assert.equal(invalid.checks.find((entry) => entry.name === 'resource-pack-http-complete')?.ok, false);
+    assert.equal(invalid.checks.find((entry) =>
+      entry.name === 'resource-pack-exact-body-verified')?.ok, false);
+
+    const wrongPack = structuredClone(evidence);
+    wrongPack.resourcePack.succeeded = true;
+    wrongPack.resourcePack.transactions[0].loadingFinished = true;
+    wrongPack.resourcePack.transactions[0].bodyVerification.sha1 = '0'.repeat(40);
+    await writeFile(evidencePath, `${JSON.stringify(wrongPack, null, 2)}\n`);
+    const wrongPackRejected = await validateEvidence(evidencePath, {
+      expectedTarget: target,
+      expectedRelay: relay,
+      expectedArtifact: artifact,
+      throwOnFailure: false,
+    });
+    assert.equal(wrongPackRejected.checks.find((entry) =>
+      entry.name === 'resource-pack-exact-body-verified')?.ok, false);
+
+    const preflightOnly = structuredClone(wrongPack);
+    preflightOnly.resourcePack.transactions[0].bodyVerification.sha1 = expectedResourcePack.sha1;
+    preflightOnly.resourcePack.transactions[0].method = 'OPTIONS';
+    await writeFile(evidencePath, `${JSON.stringify(preflightOnly, null, 2)}\n`);
+    const preflightRejected = await validateEvidence(evidencePath, {
+      expectedTarget: target,
+      expectedRelay: relay,
+      expectedArtifact: artifact,
+      throwOnFailure: false,
+    });
+    assert.equal(preflightRejected.checks.find((entry) =>
+      entry.name === 'resource-pack-exact-body-verified')?.ok, false);
+
+    const wrongLength = structuredClone(evidence);
+    wrongLength.resourcePack.transactions[0].declaredContentLength = expectedResourcePack.bytes - 1;
+    await writeFile(evidencePath, `${JSON.stringify(wrongLength, null, 2)}\n`);
+    const wrongLengthRejected = await validateEvidence(evidencePath, {
+      expectedTarget: target,
+      expectedRelay: relay,
+      expectedArtifact: artifact,
+      throwOnFailure: false,
+    });
+    assert.equal(wrongLengthRejected.checks.find((entry) =>
+      entry.name === 'resource-pack-exact-body-verified')?.ok, false);
+
+    const wrongUrl = structuredClone(evidence);
+    wrongUrl.resourcePack.transactions[0].url = expectedResourcePackProxy(
+      'wss://wrong.example/tunnel');
+    await writeFile(evidencePath, `${JSON.stringify(wrongUrl, null, 2)}\n`);
+    const wrongUrlRejected = await validateEvidence(evidencePath, {
+      expectedTarget: target,
+      expectedRelay: relay,
+      expectedArtifact: artifact,
+      throwOnFailure: false,
+    });
+    assert.equal(wrongUrlRejected.checks.find((entry) =>
+      entry.name === 'resource-pack-exact-body-verified')?.ok, false);
     console.log(`CHECK_MULTIPLAYER_TERRAIN_EVIDENCE_STATIC_OK checks=${valid.checks.length}`);
   } finally {
     await rm(directory, { recursive: true, force: true });

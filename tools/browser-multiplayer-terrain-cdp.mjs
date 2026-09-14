@@ -13,6 +13,15 @@ import {
 } from './terrain-visual-metrics.mjs';
 
 const sleep = (milliseconds) => new Promise((done) => setTimeout(done, milliseconds));
+const expectedResourcePack = Object.freeze({
+  originalUrl: 'https://jihulab.com/-/project/356228/uploads/e409655d230380173547e68c5ef026d4/resource_pack.zip',
+  fixedMirrorUrl: 'https://typethe0ry.github.io/Gaius/proxy/resource-pack',
+  bytes: 61_102_872,
+  sha1: '008381d7a89976709aa86bb71dee06dc50bb3961',
+  sha256: 'ee96a1fe577a90f1c2a3f686cdec060a3cbf0f127ae8e0585cb79dd93e69e172',
+});
+const cdpResourcePackBufferBytes = 96 * 1024 * 1024;
+const cdpTotalNetworkBufferBytes = 256 * 1024 * 1024;
 
 function envInteger(name, fallback, minimum = 1) {
   const raw = process.env[name];
@@ -301,6 +310,74 @@ function normalizeRelay(value) {
   }
 }
 
+function expectedResourcePackProxy(relay) {
+  try {
+    const url = new URL(String(relay || '').trim());
+    if (url.protocol === 'ws:') url.protocol = 'http:';
+    if (url.protocol === 'wss:') url.protocol = 'https:';
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return '';
+    url.pathname = '/proxy/resource-pack';
+    url.hash = '';
+    url.search = '';
+    url.searchParams.set('url', expectedResourcePack.originalUrl);
+    url.searchParams.set('stream', '1');
+    return url.href;
+  } catch {
+    return '';
+  }
+}
+
+function resourcePackUrlMatchesExpected(value, relay) {
+  try {
+    const actual = new URL(String(value || ''));
+    const fixedMirror = new URL(expectedResourcePack.fixedMirrorUrl);
+    if (actual.href === fixedMirror.href) return true;
+    const expected = new URL(expectedResourcePackProxy(relay));
+    const parameterNames = [...new Set(actual.searchParams.keys())].sort();
+    return actual.protocol === expected.protocol
+      && actual.hostname.toLowerCase() === expected.hostname.toLowerCase()
+      && actual.port === expected.port
+      && actual.pathname === expected.pathname
+      && actual.username === ''
+      && actual.password === ''
+      && actual.hash === ''
+      && actual.searchParams.getAll('url').length === 1
+      && actual.searchParams.get('url') === expectedResourcePack.originalUrl
+      && actual.searchParams.getAll('stream').length === 1
+      && actual.searchParams.get('stream') === '1'
+      && actual.searchParams.getAll('token').length <= 1
+      && parameterNames.every((name) => ['stream', 'token', 'url'].includes(name));
+  } catch {
+    return false;
+  }
+}
+
+function responseHeader(headers, name) {
+  const expected = String(name).toLowerCase();
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (String(key).toLowerCase() === expected) return String(value);
+  }
+  return null;
+}
+
+function verifiedExpectedResourcePackTransaction(entry, relay) {
+  const body = entry?.bodyVerification;
+  return String(entry?.requestId || '').length > 0
+    && entry?.method === 'GET'
+    && resourcePackUrlMatchesExpected(entry.url, relay)
+    && Number(entry.status) >= 200
+    && Number(entry.status) < 300
+    && entry.loadingFinished === true
+    && Number(entry.encodedDataLength) > 0
+    && !entry.loadingFailed
+    && Number(entry.declaredContentLength) === expectedResourcePack.bytes
+    && body?.base64Encoded === true
+    && Number(body?.bytes) === expectedResourcePack.bytes
+    && body?.sha1 === expectedResourcePack.sha1
+    && body?.sha256 === expectedResourcePack.sha256
+    && !body?.error;
+}
+
 function relayNodeSuccesses(bridgeStats, relay) {
   const normalizedRelay = normalizeRelay(relay);
   let successes = 0;
@@ -355,16 +432,15 @@ function observedEndpoints(finalSnapshot) {
   return { targets, relays: [...relays] };
 }
 
-function summarizeResourcePack(transactions) {
+function summarizeResourcePack(transactions, relay) {
   const entries = [...transactions.values()].map((entry) => ({ ...entry }));
-  const successful = entries.filter((entry) =>
-    Number(entry.status) >= 200
-    && Number(entry.status) < 300
-    && entry.loadingFinished === true
-    && Number(entry.encodedDataLength) > 0
-    && !entry.loadingFailed);
+  const successful = entries.filter((entry) => verifiedExpectedResourcePackTransaction(entry, relay));
   return {
     required: true,
+    expected: {
+      ...expectedResourcePack,
+      proxyUrl: expectedResourcePackProxy(relay),
+    },
     succeeded: successful.length > 0,
     successfulRequestIds: successful.map((entry) => entry.requestId),
     transactions: entries,
@@ -458,6 +534,18 @@ async function runStaticSelfTest() {
   assert.equal(terrainVisual.terrainVisualPass, true);
   assert.equal(terrainVisualPass(skyHudVisual), false);
   assert.equal(skyHudVisual.terrainVisualPass, false);
+  assert.equal(resourcePackUrlMatchesExpected(
+    expectedResourcePackProxy('WSS://RELAY.EXAMPLE/TUNNEL/'),
+    'wss://relay.example/tunnel'), true);
+  assert.equal(resourcePackUrlMatchesExpected(
+    expectedResourcePackProxy('wss://wrong.example/tunnel'),
+    'wss://relay.example/tunnel'), false);
+  assert.equal(resourcePackUrlMatchesExpected(
+    expectedResourcePack.fixedMirrorUrl,
+    'wss://relay.example/tunnel'), true);
+  assert.equal(resourcePackUrlMatchesExpected(
+    `${expectedResourcePack.fixedMirrorUrl}?cache-bust=1`,
+    'wss://relay.example/tunnel'), false);
   const fixture = {
     expected: { target: 'example.test:25565', relay: 'wss://relay.example/tunnel' },
     artifactIdentity: { unchanged: true },
@@ -537,6 +625,29 @@ async function runStaticSelfTest() {
   zeroSuccess.final.bridgeStats.relayNodes['WSS://RELAY.EXAMPLE/TUNNEL/'].successes = 0;
   zeroSuccess.relayConnectionEvidence = relayConnectionEvidence(zeroSuccess.final);
   assert.equal(acceptanceGates(zeroSuccess).relayConnectionBound, false);
+  const exactPackFixture = new Map([['pack', {
+    requestId: 'pack',
+    method: 'GET',
+    url: expectedResourcePackProxy(fixture.expected.relay),
+    status: 200,
+    declaredContentLength: expectedResourcePack.bytes,
+    loadingFinished: true,
+    encodedDataLength: expectedResourcePack.bytes,
+    loadingFailed: null,
+    bodyVerification: { base64Encoded: true, ...expectedResourcePack },
+  }]]);
+  assert.equal(summarizeResourcePack(exactPackFixture, fixture.expected.relay).succeeded, true);
+  exactPackFixture.get('pack').method = 'OPTIONS';
+  assert.equal(summarizeResourcePack(exactPackFixture, fixture.expected.relay).succeeded, false);
+  exactPackFixture.get('pack').method = 'GET';
+  exactPackFixture.get('pack').bodyVerification.sha1 = '0'.repeat(40);
+  assert.equal(summarizeResourcePack(exactPackFixture, fixture.expected.relay).succeeded, false);
+  exactPackFixture.get('pack').bodyVerification.sha1 = expectedResourcePack.sha1;
+  exactPackFixture.get('pack').declaredContentLength = expectedResourcePack.bytes - 1;
+  assert.equal(summarizeResourcePack(exactPackFixture, fixture.expected.relay).succeeded, false);
+  exactPackFixture.get('pack').declaredContentLength = expectedResourcePack.bytes;
+  exactPackFixture.get('pack').url = expectedResourcePackProxy('wss://wrong.example/tunnel');
+  assert.equal(summarizeResourcePack(exactPackFixture, fixture.expected.relay).succeeded, false);
   fixture.logs.evaluateExceptions.push({ message: 'synthetic failure' });
   assert.equal(acceptanceGates(fixture).evaluateExceptionsClean, false);
   assert.match(formatExceptionDetails({ text: 'boom', lineNumber: 0, columnNumber: 2 }), /boom.*:1:3/);
@@ -583,7 +694,10 @@ async function main() {
     profile,
     artifact,
     artifactIdentity: { ...initialArtifactIdentity, unchanged: null },
-    expected: { target, relay, packChoice },
+    expected: {
+      target, relay, packChoice,
+      resourcePack: { ...expectedResourcePack, proxyUrl: expectedResourcePackProxy(relay) },
+    },
     // Compatibility fields retained for older evidence consumers.
     target,
     relay,
@@ -658,6 +772,7 @@ async function main() {
   let cdp;
   const requestUrls = new Map();
   const resourcePackTransactions = new Map();
+  const pendingResourcePackBodyVerifications = [];
   try {
     await Promise.race([
       waitJson(`http://127.0.0.1:${debugPort}/json/version`),
@@ -699,6 +814,17 @@ async function main() {
           loadingFinished: false,
           loadingFailed: null,
         });
+      } else if (resourcePackUrlMatchesExpected(url, relay)) {
+        resourcePackTransactions.set(event.requestId, {
+          requestId: event.requestId,
+          url,
+          method: event.request?.method || '',
+          requestedAt: new Date().toISOString(),
+          status: null,
+          mimeType: null,
+          loadingFinished: false,
+          loadingFailed: null,
+        });
       }
       boundedAppend(report.logs.requests, {
         url, method: event.request?.method || '', type: event.type || '', documentURL: event.documentURL || '',
@@ -715,7 +841,8 @@ async function main() {
         mimeType: event.response?.mimeType || '', type: event.type || '',
       }, 1_000);
       const resourcePack = resourcePackTransactions.get(event.requestId);
-      if (resourcePack || /\/proxy\/resource-pack(?:\?|$)/i.test(url)) {
+      if (resourcePack || /\/proxy\/resource-pack(?:\?|$)/i.test(url)
+          || resourcePackUrlMatchesExpected(url, relay)) {
         const transaction = resourcePack || {
           requestId: event.requestId,
           url,
@@ -727,6 +854,8 @@ async function main() {
         transaction.url = url;
         transaction.status = event.response?.status ?? null;
         transaction.mimeType = event.response?.mimeType || null;
+        transaction.declaredContentLength = responseHeader(
+          event.response?.headers, 'content-length');
         transaction.responseAt = new Date().toISOString();
         resourcePackTransactions.set(event.requestId, transaction);
       }
@@ -747,6 +876,42 @@ async function main() {
         resourcePack.loadingFinished = true;
         resourcePack.finishedAt = new Date().toISOString();
         resourcePack.encodedDataLength = event.encodedDataLength ?? null;
+        if (resourcePack.method === 'GET'
+            && resourcePackUrlMatchesExpected(resourcePack.url, relay)
+            && resourcePack.bodyVerification === undefined
+            && resourcePack.bodyVerificationPending !== true) {
+          resourcePack.bodyVerificationPending = true;
+          const verification = (async () => {
+            try {
+              const result = await cdp.send('Network.getResponseBody', {
+                requestId: event.requestId,
+              }, 120_000);
+              if (result.base64Encoded !== true) {
+                throw new Error('CDP returned the binary resource pack without base64 encoding');
+              }
+              const body = Buffer.from(result.body || '', 'base64');
+              resourcePack.bodyVerification = {
+                base64Encoded: true,
+                bytes: body.length,
+                sha1: createHash('sha1').update(body).digest('hex'),
+                sha256: createHash('sha256').update(body).digest('hex'),
+                verifiedAt: new Date().toISOString(),
+              };
+            } catch (error) {
+              resourcePack.bodyVerification = {
+                base64Encoded: false,
+                bytes: null,
+                sha1: null,
+                sha256: null,
+                error: String(error?.stack || error),
+                verifiedAt: new Date().toISOString(),
+              };
+            } finally {
+              delete resourcePack.bodyVerificationPending;
+            }
+          })();
+          pendingResourcePackBodyVerifications.push(verification);
+        }
       }
     });
     cdp.on('Network.loadingFailed', (event) => boundedAppend(report.logs.failedResources, {
@@ -770,7 +935,10 @@ async function main() {
     await Promise.all([
       cdp.send('Runtime.enable'),
       cdp.send('Page.enable'),
-      cdp.send('Network.enable'),
+      cdp.send('Network.enable', {
+        maxTotalBufferSize: cdpTotalNetworkBufferBytes,
+        maxResourceBufferSize: cdpResourcePackBufferBytes,
+      }),
     ]);
 
     const launchUrl = `file:///${artifact.replaceAll('\\', '/')}?server=${encodeURIComponent(target)}`
@@ -970,6 +1138,7 @@ async function main() {
     report.error = String(error?.stack || error);
     console.error(report.error);
   } finally {
+    await Promise.allSettled(pendingResourcePackBodyVerifications);
     await stopChrome(chrome, cdp, report);
     const profileCleanup = await removeChromeProfile(profileDir);
     report.cleanup.profileRemoved = profileCleanup.removed;
@@ -990,7 +1159,7 @@ async function main() {
     if (report.final) report.final.screenshots = [...report.screenshots];
     report.observed = observedEndpoints(report.final);
     report.relayConnectionEvidence = relayConnectionEvidence(report.final);
-    report.resourcePack = summarizeResourcePack(resourcePackTransactions);
+    report.resourcePack = summarizeResourcePack(resourcePackTransactions, relay);
     report.gates = acceptanceGates(report);
     report.success = Object.values(report.gates).every(Boolean);
     report.finishedAt = new Date().toISOString();
