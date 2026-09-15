@@ -115,6 +115,11 @@ function boundedAppend(array, value, limit) {
   if (array.length < limit) array.push(value);
 }
 
+function boundedTailAppend(array, value, limit) {
+  array.push(value);
+  if (array.length > limit) array.splice(0, array.length - limit);
+}
+
 function formatExceptionDetails(details) {
   const description = details?.exception?.description;
   const text = details?.text;
@@ -234,6 +239,73 @@ async function evaluate(cdp, expression, report, label = 'evaluate') {
     throw new Error(`${label}: ${message}`);
   }
   return response.result?.value;
+}
+
+function isCdpCommandTimeout(error, method = 'Runtime.evaluate') {
+  const message = String(error?.message || error || '');
+  return message.startsWith(`${method} timed out after `) && /\d+ms$/.test(message);
+}
+
+async function evaluateWithRetry(cdp, expression, report, label, {
+  attempts = 4,
+  delayMilliseconds = 2_000,
+} = {}) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await evaluate(cdp, expression, report, label);
+    } catch (error) {
+      if (!isCdpCommandTimeout(error) || attempt === attempts) throw error;
+      lastError = error;
+      boundedTailAppend(report.logs.evaluateTimeouts, {
+        at: new Date().toISOString(), label, attempt, attempts,
+        message: String(error.message || error), retrying: true,
+      }, 100);
+      await sleep(delayMilliseconds);
+    }
+  }
+  throw lastError;
+}
+
+function appendConsoleEntry(report, entry) {
+  // Resource-pack progress emits thousands of lines in a few milliseconds. Keep a bounded
+  // sample of that flood while preserving the newest disconnect/error diagnostics.
+  const progress = /Progress for pack \d+: \d+ bytes/.test(entry.text || '');
+  if (progress) {
+    report.logs.resourcePackProgressCount++;
+    if (report.logs.resourcePackProgressCount % 256 !== 1) return;
+  }
+  boundedTailAppend(report.logs.console, entry, 1_000);
+}
+
+function snapshotShowsTerminalDisconnect(snapshot) {
+  return Number(snapshot?.net?.closed) >= 1
+    || String(snapshot?.screen || '').includes('DisconnectedScreen');
+}
+
+function finalFromTrustedSample(snapshot, screenshots) {
+  if (!snapshot) return null;
+  return {
+    state: {
+      screen: snapshot.screen,
+      screenTitle: snapshot.title,
+      screenSize: snapshot.size,
+      screenWidgets: snapshot.widgets || [],
+      level: snapshot.level,
+      loadedChunkCount: snapshot.loadedChunkCount,
+      player: snapshot.player,
+      gameMode: snapshot.gameMode,
+      overlay: snapshot.overlay,
+    },
+    events: snapshot.events || [],
+    bridge: snapshot.bridge || [],
+    bridgeError: snapshot.bridgeError || null,
+    net: snapshot.net || null,
+    bridgeStats: snapshot.bridgeStats || null,
+    screenshots: [...screenshots],
+    body: null,
+    retainedFromTrustedSample: true,
+  };
 }
 
 async function click(cdp, x, y, name, report) {
@@ -650,6 +722,23 @@ async function runStaticSelfTest() {
   assert.equal(summarizeResourcePack(exactPackFixture, fixture.expected.relay).succeeded, false);
   fixture.logs.evaluateExceptions.push({ message: 'synthetic failure' });
   assert.equal(acceptanceGates(fixture).evaluateExceptionsClean, false);
+  const disconnectedSample = {
+    screen: 'net.minecraft.client.gui.screens.DisconnectedScreen',
+    title: 'Connection Lost',
+    level: null,
+    loadedChunkCount: null,
+    events: [{ event: 'client.notifyPlayerLoaded' }],
+    net: { connected: 1, closed: 1, errors: 0 },
+    bridgeStats: fixture.final.bridgeStats,
+  };
+  assert.equal(snapshotShowsTerminalDisconnect(disconnectedSample), true);
+  const retainedFinal = finalFromTrustedSample(disconnectedSample, fixture.screenshots);
+  assert.equal(retainedFinal.retainedFromTrustedSample, true);
+  assert.equal(retainedFinal.state.screenTitle, 'Connection Lost');
+  assert.equal(retainedFinal.net.closed, 1);
+  assert.equal(retainedFinal.bridgeStats.relayNodeSuccesses, 1);
+  assert.deepEqual(retainedFinal.screenshots, fixture.screenshots);
+  assert.equal(snapshotShowsTerminalDisconnect({ screen: 'TitleScreen', net: { closed: 0 } }), false);
   assert.match(formatExceptionDetails({ text: 'boom', lineNumber: 0, columnNumber: 2 }), /boom.*:1:3/);
   console.log('BROWSER_MULTIPLAYER_TERRAIN_CDP_STATIC_OK');
 }
@@ -711,6 +800,8 @@ async function main() {
     logs: {
       exceptions: [],
       evaluateExceptions: [],
+      evaluateTimeouts: [],
+      resourcePackProgressCount: 0,
       cdpEventErrors: [],
       screenshotErrors: [],
       failedResources: [],
@@ -795,11 +886,11 @@ async function main() {
       },
       100,
     ));
-    cdp.on('Runtime.consoleAPICalled', (event) => boundedAppend(report.logs.console, {
+    cdp.on('Runtime.consoleAPICalled', (event) => appendConsoleEntry(report, {
       at: new Date().toISOString(),
       type: event.type,
       text: (event.args || []).map((argument) => argument.value ?? argument.description ?? '').join(' ').slice(0, 2_000),
-    }, 1_000));
+    }));
     cdp.on('Network.requestWillBeSent', (event) => {
       const url = String(event.request?.url || '');
       requestUrls.set(event.requestId, url);
@@ -954,10 +1045,14 @@ async function main() {
     let packDone = false;
     let warningBackDone = false;
     let terrainFirstSecond = null;
+    let lastTrustedSnapshot = null;
+    let pollingStoppedAfterDisconnectTimeout = false;
 
     for (let second = 1; second <= acceptanceSeconds; second++) {
       await sleep(1_000);
-      const snapshot = await evaluate(cdp, `(() => {
+      let snapshot;
+      try {
+        snapshot = await evaluateWithRetry(cdp, `(() => {
         const state = window.__gaiusMinecraftState || {};
         return {
           screen: state.screen,
@@ -971,10 +1066,33 @@ async function main() {
           overlay: state.overlay,
           events: (window.__gaiusMinecraftEvents || []).slice(-12),
           net: window.__gaiusNetworkStats || null,
+          bridgeStats: window.__gaiusNettyBridge?.stats || null,
           bridge: window.__gaiusNettyBridgeInitTrace || [],
           bridgeError: window.__gaiusNettyBridgeInitError || null
         };
-      })()`, report, `state sample ${second}`);
+        })()`, report, `state sample ${second}`, { attempts: 3, delayMilliseconds: 1_000 });
+      } catch (error) {
+        if (isCdpCommandTimeout(error)) {
+          boundedTailAppend(report.logs.evaluateTimeouts, {
+            at: new Date().toISOString(), label: `state sample ${second}`,
+            attempt: 'exhausted', message: String(error.message || error), retrying: false,
+          }, 100);
+          if (snapshotShowsTerminalDisconnect(lastTrustedSnapshot)) {
+            pollingStoppedAfterDisconnectTimeout = true;
+            report.final = finalFromTrustedSample(lastTrustedSnapshot, report.screenshots);
+            report.actions.push({
+              at: new Date().toISOString(),
+              name: 'retain-trusted-snapshot-after-disconnect-evaluate-timeout',
+              second,
+              via: 'last successful Runtime.evaluate state sample',
+            });
+            break;
+          }
+        }
+        throw error;
+      }
+
+      lastTrustedSnapshot = snapshot;
 
       report.samples.push({
         second,
@@ -1120,16 +1238,33 @@ async function main() {
       }
     }
 
-    report.final = await evaluate(cdp, `(() => ({
-      state: window.__gaiusMinecraftState || null,
-      events: window.__gaiusMinecraftEvents || [],
-      bridge: window.__gaiusNettyBridgeInitTrace || [],
-      bridgeError: window.__gaiusNettyBridgeInitError || null,
-      net: window.__gaiusNetworkStats || null,
-      bridgeStats: window.__gaiusNettyBridge?.stats || null,
-      screenshots: ${JSON.stringify(report.screenshots)},
-      body: document.body?.innerText || ''
-    }))()`, report, 'final evidence snapshot');
+    if (!pollingStoppedAfterDisconnectTimeout) {
+      try {
+        report.final = await evaluateWithRetry(cdp, `(() => ({
+          state: window.__gaiusMinecraftState || null,
+          events: window.__gaiusMinecraftEvents || [],
+          bridge: window.__gaiusNettyBridgeInitTrace || [],
+          bridgeError: window.__gaiusNettyBridgeInitError || null,
+          net: window.__gaiusNetworkStats || null,
+          bridgeStats: window.__gaiusNettyBridge?.stats || null,
+          screenshots: ${JSON.stringify(report.screenshots)},
+          body: document.body?.innerText || ''
+        }))()`, report, 'final evidence snapshot', { attempts: 5, delayMilliseconds: 2_000 });
+      } catch (error) {
+        if (!isCdpCommandTimeout(error) || !snapshotShowsTerminalDisconnect(lastTrustedSnapshot)) throw error;
+        boundedTailAppend(report.logs.evaluateTimeouts, {
+          at: new Date().toISOString(), label: 'final evidence snapshot',
+          attempt: 'exhausted-retained-trusted-snapshot',
+          message: String(error.message || error), retrying: false,
+        }, 100);
+        report.final = finalFromTrustedSample(lastTrustedSnapshot, report.screenshots);
+        report.actions.push({
+          at: new Date().toISOString(),
+          name: 'retain-trusted-snapshot-after-final-disconnect-evaluate-timeout',
+          via: 'last successful Runtime.evaluate state sample',
+        });
+      }
+    }
     // Keep final.screenshots authoritative even when screenshots were captured after the JS literal was built.
     report.final.screenshots = [...report.screenshots];
     report.observed = observedEndpoints(report.final);

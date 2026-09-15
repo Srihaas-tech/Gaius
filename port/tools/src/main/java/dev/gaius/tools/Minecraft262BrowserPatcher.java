@@ -69,6 +69,7 @@ public final class Minecraft262BrowserPatcher {
         patchGlDeviceCapabilities(jar, root);
         patchFramerateLimiter(jar, root);
         patchGraphicsPresetBrowserDistances(jar, root);
+        patchAtlasManagerBrowserMipmapCap(jar, root);
         patchChunkGenerationCooperation(jar, root);
         patchDistanceManagerCooperation(jar, root);
         patchServerChunkBroadcastCooperation(jar, root);
@@ -93,6 +94,48 @@ public final class Minecraft262BrowserPatcher {
         patchCopyOnWriteFileSystem(jar, root);
         patchCopyOnWriteProvider(jar, root);
         patchDownloadQueueBrowserCooperativeExecutor(jar, root);
+    }
+
+    /** Caps browser atlas mip generation to avoid a 33% native-memory spike on large packs. */
+    private static void patchAtlasManagerBrowserMipmapCap(String jar, Path root)
+            throws IOException {
+        String owner = "net/minecraft/client/resources/model/sprite/AtlasManager";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode constructor = find(
+                node,
+                "<init>",
+                "(Lnet/minecraft/client/renderer/texture/TextureManager;I)V");
+        int constructorStores = 0;
+        for (AbstractInsnNode instruction : constructor.instructions.toArray()) {
+            if (!(instruction instanceof FieldInsnNode field)
+                    || field.getOpcode() != Opcodes.PUTFIELD
+                    || !field.owner.equals(owner)
+                    || !field.name.equals("maxMipmapLevels")
+                    || !field.desc.equals("I")) {
+                continue;
+            }
+            AbstractInsnNode value = previousOpcode(field);
+            if (!(value instanceof VarInsnNode load)
+                    || load.getOpcode() != Opcodes.ILOAD
+                    || load.var != 2) {
+                throw new IllegalStateException(
+                        owner + " constructor mipmap assignment shape changed");
+            }
+            constructor.instructions.set(value, new InsnNode(Opcodes.ICONST_0));
+            constructorStores++;
+        }
+        requireOne(owner + " constructor browser mipmap cap", constructorStores);
+
+        MethodNode update = find(node, "updateMaxMipLevel", "(I)V");
+        InsnList updateCode = new InsnList();
+        updateCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        updateCode.add(new InsnNode(Opcodes.ICONST_0));
+        updateCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "maxMipmapLevels", "I"));
+        updateCode.add(new InsnNode(Opcodes.RETURN));
+        replace(update, updateCode, 2, update.maxLocals);
+        writeComputeFrames(node, root.resolve(owner + ".class"));
+        System.out.println("Capped 26.2 browser atlas mipmaps at level zero");
     }
 
     /**

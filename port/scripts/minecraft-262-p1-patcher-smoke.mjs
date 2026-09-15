@@ -986,6 +986,57 @@ try {
     encoding: "utf8", timeout: 30_000,
   });
 
+  const patchedSpriteContents = execFileSync(javap, ["-classpath", clientJar,
+    "-p", "-c", "net.minecraft.client.renderer.texture.SpriteContents"], {
+      encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+    });
+  const staticImageRelease = method(patchedSpriteContents,
+    "public void browserReleaseStaticImagesAfterUpload();",
+    "public java.lang.String toString();");
+  assert.equal(occurrences(staticImageRelease,
+    "NativeImage.close"), 1,
+  "26.2 static sprite release must close every retained native mip image");
+  assert.match(staticImageRelease, /Field animatedTexture/,
+    "26.2 static sprite release lost its animation guard");
+  assert.match(staticImageRelease, /anewarray\s+#[0-9]+\s+\/\/ class com\/mojang\/blaze3d\/platform\/NativeImage/,
+    "26.2 static sprite release must detach the closed mip array");
+
+  const patchedTextureAtlas = execFileSync(javap, ["-classpath", clientJar,
+    "-p", "-c", "net.minecraft.client.renderer.texture.TextureAtlas"], {
+      encoding: "utf8", maxBuffer: 12 * 1024 * 1024, timeout: 30_000,
+    });
+  const atlasInitialUpload = method(patchedTextureAtlas,
+    "private void uploadInitialContents();",
+    "public void dumpContents(");
+  assert.equal(occurrences(atlasInitialUpload,
+    "browserReleaseStaticSpriteImages"), 1,
+  "26.2 initial atlas upload must release static CPU images exactly once");
+  assert.ok(atlasInitialUpload.lastIndexOf("browserReleaseStaticSpriteImages")
+      > atlasInitialUpload.indexOf("Method uploadAnimationFrames:()V"),
+  "26.2 atlas CPU-image release must run after the final initial texture upload");
+  const atlasStaticRelease = method(patchedTextureAtlas,
+    "private void browserReleaseStaticSpriteImages();");
+  assert.equal(occurrences(atlasStaticRelease,
+    "SpriteContents.browserReleaseStaticImagesAfterUpload"), 1,
+  "26.2 atlas static release helper must visit every sprite contents object");
+
+  const patchedAtlasManager = execFileSync(javap, ["-classpath", clientJar,
+    "-p", "-c", "net.minecraft.client.resources.model.sprite.AtlasManager"], {
+      encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+    });
+  const atlasManagerConstructor = method(patchedAtlasManager,
+    "public net.minecraft.client.resources.model.sprite.AtlasManager(net.minecraft.client.renderer.texture.TextureManager, int);",
+    "public net.minecraft.client.renderer.texture.TextureAtlas getAtlasOrThrow");
+  assert.match(atlasManagerConstructor,
+    /iconst_0\s+\d+: putfield\s+#[0-9]+\s+\/\/ Field maxMipmapLevels:I/,
+    "26.2 browser AtlasManager constructor must cap mipmaps at zero");
+  const updateMaxMipLevel = method(patchedAtlasManager,
+    "public void updateMaxMipLevel(int);",
+    "public void close();");
+  assert.match(updateMaxMipLevel,
+    /iconst_0\s+\d+: putfield\s+#[0-9]+\s+\/\/ Field maxMipmapLevels:I/,
+    "26.2 browser AtlasManager updates must preserve the zero-mipmap cap");
+
   // Verify the client crack overlay probe was inserted into the actual ASM
   // methods, rather than merely checking source names or patcher strings.
   const patchedClientLevel = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",

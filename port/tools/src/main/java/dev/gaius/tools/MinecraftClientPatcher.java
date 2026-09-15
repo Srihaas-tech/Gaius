@@ -147,6 +147,7 @@ public final class MinecraftClientPatcher {
         if ("26.2".equals(minecraftVersion)) {
             patchTextureUtilBrowserSolidify(args[0], root.resolve(
                     "com/mojang/blaze3d/platform/TextureUtil.class"));
+            patchTextureAtlasBrowserReleaseStaticImages(args[0], root);
         }
         patchBrowserInputCallbacks(args[0], root);
         patchGuiGraphicsBrowserItemCache(args[0], root);
@@ -12650,6 +12651,173 @@ public final class MinecraftClientPatcher {
         }
         method.maxStack = Math.max(method.maxStack, 1);
         writeComputeFrames(node, output);
+    }
+
+    /**
+     * Releases decoded static sprite pixels as soon as the 26.2 atlas upload has consumed them.
+     *
+     * <p>Desktop Minecraft can leave every {@code SpriteContents.byMipLevel} image reachable for
+     * the complete atlas lifetime. In the browser those {@code NativeImage} instances own explicit
+     * {@code BrowserMemory} regions, so a large server pack can retain more than the 2 GiB native
+     * budget while later reload listeners are still preparing. Animated sprites keep their source
+     * images because animation uploads need them; static sprites have already been copied to GPU
+     * textures when {@code TextureAtlas.uploadInitialContents()} returns.</p>
+     */
+    private static void patchTextureAtlasBrowserReleaseStaticImages(String jar, Path root)
+            throws IOException {
+        String spriteOwner = "net/minecraft/client/renderer/texture/SpriteContents";
+        String imageOwner = "com/mojang/blaze3d/platform/NativeImage";
+        ClassNode sprite = read(jar, spriteOwner + ".class");
+        if (findNullable(sprite, "browserReleaseStaticImagesAfterUpload", "()V") != null) {
+            throw new IOException("SpriteContents static-image release helper already exists");
+        }
+
+        MethodNode release = new MethodNode(
+                Opcodes.ACC_PUBLIC,
+                "browserReleaseStaticImagesAfterUpload",
+                "()V",
+                null,
+                null);
+        LabelNode returnLabel = new LabelNode();
+        LabelNode loop = new LabelNode();
+        LabelNode next = new LabelNode();
+        InsnList releaseCode = release.instructions;
+        releaseCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        releaseCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                spriteOwner,
+                "animatedTexture",
+                "Lnet/minecraft/client/renderer/texture/SpriteContents$AnimatedTexture;"));
+        releaseCode.add(new JumpInsnNode(Opcodes.IFNONNULL, returnLabel));
+        releaseCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        releaseCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                spriteOwner,
+                "byMipLevel",
+                "[Lcom/mojang/blaze3d/platform/NativeImage;"));
+        releaseCode.add(new VarInsnNode(Opcodes.ASTORE, 1));
+        releaseCode.add(new InsnNode(Opcodes.ICONST_0));
+        releaseCode.add(new VarInsnNode(Opcodes.ISTORE, 2));
+        releaseCode.add(loop);
+        releaseCode.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        releaseCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        releaseCode.add(new InsnNode(Opcodes.ARRAYLENGTH));
+        releaseCode.add(new JumpInsnNode(Opcodes.IF_ICMPGE, next));
+        releaseCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        releaseCode.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        releaseCode.add(new InsnNode(Opcodes.AALOAD));
+        releaseCode.add(new VarInsnNode(Opcodes.ASTORE, 3));
+        LabelNode skipNull = new LabelNode();
+        releaseCode.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        releaseCode.add(new JumpInsnNode(Opcodes.IFNULL, skipNull));
+        releaseCode.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        releaseCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, imageOwner, "close", "()V", false));
+        releaseCode.add(skipNull);
+        releaseCode.add(new IincInsnNode(2, 1));
+        releaseCode.add(new JumpInsnNode(Opcodes.GOTO, loop));
+        releaseCode.add(next);
+        releaseCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        releaseCode.add(new InsnNode(Opcodes.ICONST_0));
+        releaseCode.add(new TypeInsnNode(Opcodes.ANEWARRAY, imageOwner));
+        releaseCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD,
+                spriteOwner,
+                "byMipLevel",
+                "[Lcom/mojang/blaze3d/platform/NativeImage;"));
+        releaseCode.add(returnLabel);
+        releaseCode.add(new InsnNode(Opcodes.RETURN));
+        release.maxStack = 2;
+        release.maxLocals = 4;
+        sprite.methods.add(release);
+        writeComputeFrames(sprite, root.resolve(spriteOwner + ".class"));
+
+        String atlasOwner = "net/minecraft/client/renderer/texture/TextureAtlas";
+        ClassNode atlas = read(jar, atlasOwner + ".class");
+        if (findNullable(atlas, "browserReleaseStaticSpriteImages", "()V") != null) {
+            throw new IOException("TextureAtlas static-image release helper already exists");
+        }
+        MethodNode releaseAll = new MethodNode(
+                Opcodes.ACC_PRIVATE,
+                "browserReleaseStaticSpriteImages",
+                "()V",
+                null,
+                null);
+        LabelNode allLoop = new LabelNode();
+        LabelNode allDone = new LabelNode();
+        InsnList allCode = releaseAll.instructions;
+        allCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        allCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, atlasOwner, "sprites", "Ljava/util/List;"));
+        allCode.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/List",
+                "iterator",
+                "()Ljava/util/Iterator;",
+                true));
+        allCode.add(new VarInsnNode(Opcodes.ASTORE, 1));
+        allCode.add(allLoop);
+        allCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        allCode.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Iterator",
+                "hasNext",
+                "()Z",
+                true));
+        allCode.add(new JumpInsnNode(Opcodes.IFEQ, allDone));
+        allCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        allCode.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Iterator",
+                "next",
+                "()Ljava/lang/Object;",
+                true));
+        allCode.add(new TypeInsnNode(
+                Opcodes.CHECKCAST,
+                "net/minecraft/client/renderer/texture/TextureAtlasSprite"));
+        allCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/renderer/texture/TextureAtlasSprite",
+                "contents",
+                "()Lnet/minecraft/client/renderer/texture/SpriteContents;",
+                false));
+        allCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                spriteOwner,
+                "browserReleaseStaticImagesAfterUpload",
+                "()V",
+                false));
+        allCode.add(new JumpInsnNode(Opcodes.GOTO, allLoop));
+        allCode.add(allDone);
+        allCode.add(new InsnNode(Opcodes.RETURN));
+        releaseAll.maxStack = 1;
+        releaseAll.maxLocals = 2;
+        atlas.methods.add(releaseAll);
+
+        MethodNode upload = find(atlas, "uploadInitialContents", "()V");
+        int returns = 0;
+        for (AbstractInsnNode instruction = upload.instructions.getFirst(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction.getOpcode() != Opcodes.RETURN) {
+                continue;
+            }
+            InsnList call = new InsnList();
+            call.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            call.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    atlasOwner,
+                    "browserReleaseStaticSpriteImages",
+                    "()V",
+                    false));
+            upload.instructions.insertBefore(instruction, call);
+            returns++;
+        }
+        if (returns != 1) {
+            throw new IOException(
+                    "TextureAtlas uploadInitialContents return shape changed: " + returns);
+        }
+        writeComputeFrames(atlas, root.resolve(atlasOwner + ".class"));
+        System.out.println("Released 26.2 static sprite NativeImages after atlas upload");
     }
 
     /** Labels the handful of large vanilla continuations that dominate custom resource-pack stalls. */
