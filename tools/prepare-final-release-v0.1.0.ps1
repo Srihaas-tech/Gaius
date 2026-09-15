@@ -6,7 +6,10 @@ param(
     [Parameter(Mandatory = $true)][string]$Multiplayer12111Evidence,
     [Parameter(Mandatory = $true)][string]$Multiplayer262Evidence,
     [string]$Multiplayer12111Target = 't40.sjcmc.cn:14803',
-    [string]$Multiplayer262Target = 't40.sjcmc.cn:14803'
+    [string]$Multiplayer262Target = 't40.sjcmc.cn:14803',
+    [string]$PagesDefaultTarget = 't40.sjcmc.cn:14803',
+    [string]$Pages12111DefaultTarget = '',
+    [string]$Pages262DefaultTarget = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -23,6 +26,25 @@ $requiredAssets = @(
 )
 
 function Fail([string]$Message) { throw "FINAL RELEASE PREP: $Message" }
+function Assert-ReleaseSourceState {
+    $branch = (& git symbolic-ref --quiet --short HEAD 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $branch -ne 'main') {
+        Fail "release preparation requires the checked-out main branch (actual=$branch)"
+    }
+    $trackedStatus = @(& git status --porcelain=v1 --untracked-files=no)
+    if ($LASTEXITCODE -ne 0) { Fail 'could not inspect tracked source state' }
+    if ($trackedStatus.Count -ne 0) {
+        Fail "tracked source changes must be committed before preparation: $($trackedStatus -join '; ')"
+    }
+}
+$pagesDefaultTarget = $PagesDefaultTarget.Trim()
+if ([string]::IsNullOrWhiteSpace($pagesDefaultTarget)) { Fail 'Pages default target was not supplied' }
+$pages12111DefaultTarget = if ([string]::IsNullOrWhiteSpace($Pages12111DefaultTarget)) {
+    $pagesDefaultTarget
+} else { $Pages12111DefaultTarget.Trim() }
+$pages262DefaultTarget = if ([string]::IsNullOrWhiteSpace($Pages262DefaultTarget)) {
+    $pagesDefaultTarget
+} else { $Pages262DefaultTarget.Trim() }
 function Resolve-Input([string]$Path, [string]$Label) {
     if ([string]::IsNullOrWhiteSpace($Path)) { Fail "$Label was not supplied" }
     $candidate = if ([IO.Path]::IsPathRooted($Path)) { $Path } else { Join-Path $root $Path }
@@ -200,6 +222,7 @@ function Assert-ExactStage([string]$Path) {
     if (@(Get-ChildItem -LiteralPath $Path -Force -Directory).Count -ne 0) { Fail 'stage contains unexpected directories' }
 }
 
+Assert-ReleaseSourceState
 $p12111 = Verify-Portable '1.21.11'
 $p262 = Verify-Portable '26.2'
 $single12111Path = Resolve-Input $Singleplayer12111Evidence '1.21.11 singleplayer evidence'
@@ -280,13 +303,17 @@ $releaseManifest = [ordered]@{
     }
     relay = [ordered]@{
         url = $multiplayerRelay
-        target = $Multiplayer12111Target
+        # Backward-compatible alias for the launcher default. Evidence targets
+        # remain independently bound under relay.targets.
+        target = $pagesDefaultTarget
         targets = [ordered]@{ '1.21.11' = $Multiplayer12111Target; '26.2' = $Multiplayer262Target }
         strictTerrainGate = 'passed'
     }
     pages = [ordered]@{
         home = 'https://typethe0ry.github.io/Gaius/'; '1.21.11' = 'https://typethe0ry.github.io/Gaius/1.21.11/'
         '26.2' = 'https://typethe0ry.github.io/Gaius/26.2/'; relayRegistry = 'https://typethe0ry.github.io/Gaius/relay-nodes.json'
+        defaultTarget = $pagesDefaultTarget
+        defaultTargets = [ordered]@{ '1.21.11' = $pages12111DefaultTarget; '26.2' = $pages262DefaultTarget }
     }
 }
 [IO.File]::WriteAllText((Join-Path $stagePath 'release.manifest.json'), (($releaseManifest | ConvertTo-Json -Depth 12) + "`n"), $utf8NoBom)

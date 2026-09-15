@@ -1107,6 +1107,30 @@ try {
   assert.equal(occurrences(atlasManagerRelease,
     "TextureAtlas.browserPrepareForSpriteReload"), 1,
   "26.2 atlas manager release helper must visit every existing atlas");
+  const patchedPendingStitches = execFileSync(javap, ["-classpath", clientJar,
+    "-p", "-c",
+    "net.minecraft.client.resources.model.sprite.AtlasManager$PendingStitchResults"], {
+      encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+    });
+  const pendingJoinAndUpload = method(patchedPendingStitches,
+    "public java.util.Map<net.minecraft.client.resources.model.sprite.SpriteId, net.minecraft.client.renderer.texture.TextureAtlasSprite> joinAndUpload();",
+    "public java.util.concurrent.CompletableFuture<net.minecraft.client.renderer.texture.SpriteLoader$Preparations> get(");
+  assert.equal(occurrences(pendingJoinAndUpload, "java/util/List.clear:()V"), 1,
+    "26.2 atlas upload must clear the pending stitch list exactly once");
+  assert.equal(occurrences(pendingJoinAndUpload, "java/util/Map.clear:()V"), 1,
+    "26.2 atlas upload must clear the preparation-future map exactly once");
+  const pendingJoinInstructions = bytecodeInstructions(pendingJoinAndUpload);
+  const resultLoad = pendingJoinInstructions.findLastIndex(({instruction}) =>
+    instruction === "aload_1");
+  const listClear = pendingJoinInstructions.findIndex(({instruction}) =>
+    instruction.includes("java/util/List.clear:()V"));
+  const mapClear = pendingJoinInstructions.findIndex(({instruction}) =>
+    instruction.includes("java/util/Map.clear:()V"));
+  const resultReturn = pendingJoinInstructions.findIndex(({instruction}) =>
+    instruction === "areturn");
+  assert.ok(resultLoad >= 0 && listClear > resultLoad && mapClear > listClear
+      && resultReturn > mapClear,
+    "26.2 atlas upload must retain its result, clear both preparation containers, then return");
 
   // Verify the client crack overlay probe was inserted into the actual ASM
   // methods, rather than merely checking source names or patcher strings.

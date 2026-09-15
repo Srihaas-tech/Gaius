@@ -45,6 +45,33 @@ function Assert-TagUnchanged([string]$ExpectedObject, [string]$Label) {
     $remote = ([string]$remoteLine[0] -split "`t")[0]
     if ($remote -ne $ExpectedObject) { Fail "$Label changed/mismatched remote tag ref ($remote != $ExpectedObject)" }
 }
+function Assert-ReleaseSourceState {
+    $branch = (& git symbolic-ref --quiet --short HEAD 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $branch -ne 'main') {
+        Fail "release publication requires the checked-out main branch (actual=$branch)"
+    }
+    $trackedStatus = @(& git status --porcelain=v1 --untracked-files=no)
+    if ($LASTEXITCODE -ne 0) { Fail 'could not inspect tracked source state' }
+    if ($trackedStatus.Count -ne 0) {
+        Fail "tracked source changes must be committed before publication: $($trackedStatus -join '; ')"
+    }
+}
+function Assert-NoOpenPullRequestsOrIssues {
+    $pullRequestJson = & gh pr list --repo $Repo --state open --limit 100 --json number,title,url
+    if ($LASTEXITCODE -ne 0) { Fail 'could not list open pull requests' }
+    $issueJson = & gh issue list --repo $Repo --state open --limit 100 --json number,title,url
+    if ($LASTEXITCODE -ne 0) { Fail 'could not list open issues' }
+    try {
+        $pullRequests = @($pullRequestJson | ConvertFrom-Json)
+        $issues = @($issueJson | ConvertFrom-Json)
+    } catch { Fail "GitHub PR/Issue inventory returned invalid JSON: $($_.Exception.Message)" }
+    if ($pullRequests.Count -ne 0) {
+        Fail "open pull requests remain: $(@($pullRequests | ForEach-Object { '#{0} {1}' -f $_.number, $_.title }) -join '; ')"
+    }
+    if ($issues.Count -ne 0) {
+        Fail "open issues remain: $(@($issues | ForEach-Object { '#{0} {1}' -f $_.number, $_.title }) -join '; ')"
+    }
+}
 function Get-PagesRuns {
     $json = & gh run list --repo $Repo --workflow pages.yml --event workflow_dispatch --limit 50 `
         --json databaseId,displayTitle,headSha,event,status,conclusion,createdAt,startedAt,url
@@ -132,6 +159,7 @@ if (-not $stagePath.StartsWith($targetRoot + [IO.Path]::DirectorySeparatorChar, 
     Fail "stage must be below port/target: $stagePath"
 }
 if (-not (Test-Path -LiteralPath $stagePath -PathType Container)) { Fail "stage does not exist: $stagePath" }
+Assert-ReleaseSourceState
 Assert-ExactAssets $stagePath
 foreach ($name in $requiredAssets) {
     if ((Get-Item -LiteralPath (Join-Path $stagePath $name)).Length -le 0) { Fail "empty stage asset: $name" }
@@ -147,7 +175,10 @@ if ($manifest.schemaVersion -ne 4 -or $manifest.tag -ne $tag -or $manifest.sourc
 if ($manifest.relay.url -ne 'wss://ellan.site/tunnel' -or
     [string]::IsNullOrWhiteSpace([string]$manifest.relay.targets.'1.21.11') -or
     [string]::IsNullOrWhiteSpace([string]$manifest.relay.targets.'26.2') -or
-    $manifest.relay.target -ne $manifest.relay.targets.'1.21.11' -or
+    [string]::IsNullOrWhiteSpace([string]$manifest.pages.defaultTarget) -or
+    [string]::IsNullOrWhiteSpace([string]$manifest.pages.defaultTargets.'1.21.11') -or
+    [string]::IsNullOrWhiteSpace([string]$manifest.pages.defaultTargets.'26.2') -or
+    $manifest.relay.target -ne $manifest.pages.defaultTarget -or
     $manifest.acceptanceEvidence.'1.21.11.multiplayer'.target -ne $manifest.relay.targets.'1.21.11' -or
     $manifest.acceptanceEvidence.'26.2.multiplayer'.target -ne $manifest.relay.targets.'26.2' -or
     $manifest.acceptanceEvidence.'1.21.11.multiplayer'.relay -ne $manifest.relay.url -or
@@ -190,6 +221,7 @@ if ((@($sumNames | Sort-Object) -join "`n") -ne ($expectedSumNames -join "`n")) 
 }
 
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { Fail 'GitHub CLI (gh) is required' }
+Assert-NoOpenPullRequestsOrIssues
 $localTagObject = (git rev-parse --verify "refs/tags/$tag").Trim()
 Assert-TagUnchanged $localTagObject 'pre-upload'
 $remoteMainLine = @(git ls-remote origin 'refs/heads/main')
@@ -208,17 +240,19 @@ if (-not $ExecuteUpload) {
     exit 0
 }
 
-# Remove only unexpected extras before upload, then clobber the exact eight
-# expected names. No command in this script creates, edits, or moves a tag.
-foreach ($asset in @($release.assets | Where-Object { $_.name -notin $requiredAssets })) {
-    & gh release delete-asset $tag $asset.name --repo $Repo --yes
-    if ($LASTEXITCODE -ne 0) { Fail "failed to delete unexpected release asset: $($asset.name)" }
-}
-Assert-TagUnchanged $localTagObject 'after extra-asset cleanup'
+# Clobber the required assets before deleting extras. If upload fails, the
+# existing release remains usable instead of first losing unrelated assets.
+# No command in this script creates, edits, or moves a tag.
+$unexpectedAssets = @($release.assets | Where-Object { $_.name -notin $requiredAssets })
 $uploadPaths = @($requiredAssets | ForEach-Object { Join-Path $stagePath $_ })
 & gh release upload $tag --repo $Repo @uploadPaths --clobber
 if ($LASTEXITCODE -ne 0) { Fail 'exact-eight release upload failed' }
 Assert-TagUnchanged $localTagObject 'after upload'
+foreach ($asset in $unexpectedAssets) {
+    & gh release delete-asset $tag $asset.name --repo $Repo --yes
+    if ($LASTEXITCODE -ne 0) { Fail "failed to delete unexpected release asset: $($asset.name)" }
+}
+Assert-TagUnchanged $localTagObject 'after extra-asset cleanup'
 
 & gh release edit $tag --repo $Repo --title 'Gaius Client 0.1.0' `
     --notes-file (Join-Path $stagePath 'RELEASE-NOTES.md') --latest
@@ -296,6 +330,9 @@ $priorPagesTarget = $env:TARGET
 $priorPagesRelay = $env:RELAY
 $priorPagesTarget12111 = $env:GAIUS_TARGET_12111
 $priorPagesTarget262 = $env:GAIUS_TARGET_262
+$priorPagesDefaultTarget = $env:GAIUS_PAGES_DEFAULT_TARGET
+$priorPageDefaultTarget12111 = $env:GAIUS_PAGE_DEFAULT_TARGET_12111
+$priorPageDefaultTarget262 = $env:GAIUS_PAGE_DEFAULT_TARGET_262
 $pagesVerifierTempRoot = Join-Path ([IO.Path]::GetTempPath()) ("gaius-pages-publish-" + [Guid]::NewGuid().ToString('N'))
 $pagesVerifierStdout = Join-Path $pagesVerifierTempRoot 'stdout.log'
 $pagesVerifierStderr = Join-Path $pagesVerifierTempRoot 'stderr.log'
@@ -306,8 +343,11 @@ try {
     [void](New-Item -ItemType Directory -Path $pagesVerifierTempRoot -Force)
     $env:OUTPUT = if ([IO.Path]::IsPathRooted($PagesEvidence)) { $PagesEvidence } else { Join-Path $root $PagesEvidence }
     $env:GAIUS_CDP_PROFILE_ROOT = $pagesVerifierTempRoot
-    $env:TARGET = [string]$manifest.relay.target
+    $env:TARGET = [string]$manifest.pages.defaultTarget
     $env:RELAY = [string]$manifest.relay.url
+    $env:GAIUS_PAGES_DEFAULT_TARGET = [string]$manifest.pages.defaultTarget
+    $env:GAIUS_PAGE_DEFAULT_TARGET_12111 = [string]$manifest.pages.defaultTargets.'1.21.11'
+    $env:GAIUS_PAGE_DEFAULT_TARGET_262 = [string]$manifest.pages.defaultTargets.'26.2'
     $env:GAIUS_TARGET_12111 = [string]$manifest.relay.targets.'1.21.11'
     $env:GAIUS_TARGET_262 = [string]$manifest.relay.targets.'26.2'
     $node = Get-Command node -ErrorAction Stop
@@ -342,6 +382,9 @@ try {
     if ($null -eq $priorPagesRelay) { Remove-Item Env:RELAY -ErrorAction SilentlyContinue } else { $env:RELAY = $priorPagesRelay }
     if ($null -eq $priorPagesTarget12111) { Remove-Item Env:GAIUS_TARGET_12111 -ErrorAction SilentlyContinue } else { $env:GAIUS_TARGET_12111 = $priorPagesTarget12111 }
     if ($null -eq $priorPagesTarget262) { Remove-Item Env:GAIUS_TARGET_262 -ErrorAction SilentlyContinue } else { $env:GAIUS_TARGET_262 = $priorPagesTarget262 }
+    if ($null -eq $priorPagesDefaultTarget) { Remove-Item Env:GAIUS_PAGES_DEFAULT_TARGET -ErrorAction SilentlyContinue } else { $env:GAIUS_PAGES_DEFAULT_TARGET = $priorPagesDefaultTarget }
+    if ($null -eq $priorPageDefaultTarget12111) { Remove-Item Env:GAIUS_PAGE_DEFAULT_TARGET_12111 -ErrorAction SilentlyContinue } else { $env:GAIUS_PAGE_DEFAULT_TARGET_12111 = $priorPageDefaultTarget12111 }
+    if ($null -eq $priorPageDefaultTarget262) { Remove-Item Env:GAIUS_PAGE_DEFAULT_TARGET_262 -ErrorAction SilentlyContinue } else { $env:GAIUS_PAGE_DEFAULT_TARGET_262 = $priorPageDefaultTarget262 }
     for ($attempt = 0; $attempt -lt 20 -and (Test-Path -LiteralPath $pagesVerifierTempRoot); $attempt++) {
         Remove-Item -LiteralPath $pagesVerifierTempRoot -Recurse -Force -ErrorAction SilentlyContinue
         if (Test-Path -LiteralPath $pagesVerifierTempRoot) { Start-Sleep -Milliseconds 250 }

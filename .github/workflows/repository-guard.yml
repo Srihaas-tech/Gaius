@@ -92,6 +92,10 @@ jobs:
             'GAIUS_CDP_PROFILE_ROOT',
             'taskkill',
             'Assert-TagUnchanged',
+            'Assert-ReleaseSourceState',
+            'Assert-NoOpenPullRequestsOrIssues',
+            'gh pr list',
+            'gh issue list',
             'gh release delete-asset',
             'git ls-remote origin'
           )) {
@@ -105,6 +109,11 @@ jobs:
             '''26.2.multiplayer''',
             'Multiplayer12111Target',
             'Multiplayer262Target',
+            'PagesDefaultTarget',
+            'Pages12111DefaultTarget',
+            'Pages262DefaultTarget',
+            'Assert-ReleaseSourceState',
+            '--untracked-files=no',
             'schemaVersion = 4',
             '$env:PROFILE'
           )) {
@@ -117,6 +126,9 @@ jobs:
             '''26.2.multiplayer''',
             'GAIUS_TARGET_12111',
             'GAIUS_TARGET_262',
+            'GAIUS_PAGES_DEFAULT_TARGET',
+            'GAIUS_PAGE_DEFAULT_TARGET_12111',
+            'GAIUS_PAGE_DEFAULT_TARGET_262',
             'schemaVersion -ne 4',
             '$env:PROFILE'
           )) {
@@ -153,7 +165,15 @@ jobs:
           foreach ($required in @('cdpClosed', 'chromeExited', 'profileRemoved', 'pagesFinalGate')) {
             if (-not $pages.Contains($required)) { throw "Pages CDP gate missing: $required" }
           }
-          foreach ($required in @('GAIUS_TARGET_12111', 'GAIUS_TARGET_262', 'expectedTargets')) {
+          foreach ($required in @(
+            'GAIUS_TARGET_12111',
+            'GAIUS_TARGET_262',
+            'GAIUS_PAGES_DEFAULT_TARGET',
+            'GAIUS_PAGE_DEFAULT_TARGET_12111',
+            'GAIUS_PAGE_DEFAULT_TARGET_262',
+            'expectedTargets',
+            'expectedPageTargets'
+          )) {
             if (-not $pages.Contains($required)) { throw "Pages per-profile target gate missing: $required" }
           }
           foreach ($required in @('CDP_COMMAND_TIMEOUT_MS', 'GAIUS_CDP_PROFILE_ROOT', 'rejectPending', 'timed out after')) {

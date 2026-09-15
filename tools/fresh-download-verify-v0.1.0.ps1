@@ -74,7 +74,10 @@ function Verify-DownloadedAssets([string]$Directory, [string]$SourceHead) {
     if ($manifest.relay.url -ne 'wss://ellan.site/tunnel' -or
         [string]::IsNullOrWhiteSpace([string]$manifest.relay.targets.'1.21.11') -or
         [string]::IsNullOrWhiteSpace([string]$manifest.relay.targets.'26.2') -or
-        $manifest.relay.target -ne $manifest.relay.targets.'1.21.11' -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.pages.defaultTarget) -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.pages.defaultTargets.'1.21.11') -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.pages.defaultTargets.'26.2') -or
+        $manifest.relay.target -ne $manifest.pages.defaultTarget -or
         $manifest.relay.strictTerrainGate -ne 'passed' -or
         $manifest.acceptanceEvidence.'1.21.11.multiplayer'.status -ne 'passed' -or
         $manifest.acceptanceEvidence.'26.2.multiplayer'.status -ne 'passed' -or
@@ -135,9 +138,13 @@ if ($SelfTest) {
                 '26.2.multiplayer' = [ordered]@{ status = 'passed'; target = 'modern.example:25565'; relay = 'wss://ellan.site/tunnel' }
             }
             relay = [ordered]@{
-                target = 'legacy.example:25565'
+                target = 'pages.example:25565'
                 targets = [ordered]@{ '1.21.11' = 'legacy.example:25565'; '26.2' = 'modern.example:25565' }
                 url = 'wss://ellan.site/tunnel'; strictTerrainGate = 'passed'
+            }
+            pages = [ordered]@{
+                defaultTarget = 'pages.example:25565'
+                defaultTargets = [ordered]@{ '1.21.11' = 'pages-legacy.example:25565'; '26.2' = 'pages-modern.example:25565' }
             }
         }
         [IO.File]::WriteAllText((Join-Path $directory 'release.manifest.json'), (($fixtureManifest | ConvertTo-Json -Depth 8) + "`n"), [Text.UTF8Encoding]::new($false))

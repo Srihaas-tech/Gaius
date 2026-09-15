@@ -10,7 +10,13 @@ const base = String(process.env.GAIUS_PAGES_BASE || 'https://typethe0ry.github.i
 const output = resolve(process.env.OUTPUT || 'artifacts/github-pages-cdp.json');
 const chromeBinary = process.env.CHROME || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
 const expectedRelay = process.env.RELAY || 'wss://ellan.site/tunnel';
-const expectedDefaultTarget = process.env.TARGET || 't40.sjcmc.cn:14803';
+const expectedDefaultTarget = process.env.GAIUS_PAGES_DEFAULT_TARGET
+  || process.env.TARGET || 't40.sjcmc.cn:14803';
+const expectedPageTargets = Object.freeze({
+  home: expectedDefaultTarget,
+  '1.21.11': process.env.GAIUS_PAGE_DEFAULT_TARGET_12111 || expectedDefaultTarget,
+  '26.2': process.env.GAIUS_PAGE_DEFAULT_TARGET_262 || expectedDefaultTarget,
+});
 const expectedTargets = Object.freeze({
   '1.21.11': process.env.GAIUS_TARGET_12111 || expectedDefaultTarget,
   '26.2': process.env.GAIUS_TARGET_262 || expectedDefaultTarget,
@@ -319,6 +325,11 @@ function pagesFinalGate({ checks, error, cleanup }) {
 }
 
 if (process.argv.includes('--static-self-test')) {
+  assert.deepEqual(expectedPageTargets, {
+    home: expectedDefaultTarget,
+    '1.21.11': process.env.GAIUS_PAGE_DEFAULT_TARGET_12111 || expectedDefaultTarget,
+    '26.2': process.env.GAIUS_PAGE_DEFAULT_TARGET_262 || expectedDefaultTarget,
+  });
   assert.deepEqual(expectedTargets, {
     '1.21.11': process.env.GAIUS_TARGET_12111 || expectedDefaultTarget,
     '26.2': process.env.GAIUS_TARGET_262 || expectedDefaultTarget,
@@ -414,6 +425,7 @@ const report = {
   base,
   checkedAt: new Date().toISOString(),
   expectedTargets,
+  expectedPageTargets,
   checks: [],
   pages: [],
   exceptions: [],
@@ -552,6 +564,8 @@ try {
   };
 
   for (const path of ['', '1.21.11/', '26.2/']) {
+    const pageProfile = path ? path.replace(/\/$/, '') : 'home';
+    const expectedPageTarget = expectedPageTargets[pageProfile];
     const url = new URL(path, base).href;
     await cdp.send('Page.navigate', { url });
     let snapshot;
@@ -576,7 +590,8 @@ try {
       && snapshot?.readyState === 'complete' && snapshot?.title.includes('Gaius'),
     `expected=${url}; actual=${snapshot?.href}; title=${snapshot?.title}`);
     check(report.checks, `${path || 'home'}-relay-default`, snapshot?.relay === expectedRelay, snapshot?.relay);
-    check(report.checks, `${path || 'home'}-target-default`, snapshot?.target === expectedDefaultTarget, snapshot?.target);
+    check(report.checks, `${path || 'home'}-target-default`, snapshot?.target === expectedPageTarget,
+      `expected=${expectedPageTarget}; actual=${snapshot?.target}`);
     check(report.checks, `${path || 'home'}-registry-rendered`, snapshot?.status?.includes(expectedRelay), snapshot?.status?.slice(0, 240));
   }
 
