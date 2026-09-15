@@ -12901,6 +12901,115 @@ public final class MinecraftClientPatcher {
         releaseOld.maxLocals = 2;
         atlas.methods.add(releaseOld);
 
+        if (findNullable(atlas, "browserPrepareForSpriteReload", "()V") != null) {
+            throw new IOException("TextureAtlas pre-reload release helper already exists");
+        }
+        MethodNode prepareForReload = new MethodNode(
+                Opcodes.ACC_PUBLIC,
+                "browserPrepareForSpriteReload",
+                "()V",
+                null,
+                null);
+        LabelNode animationLoop = new LabelNode();
+        LabelNode animationsDone = new LabelNode();
+        LabelNode spriteUboDone = new LabelNode();
+        InsnList prepareCode = prepareForReload.instructions;
+        // Detach the ticker list before closing its GPU state.  The TeaVM
+        // browser runtime cannot then observe a partially closed animation
+        // list if a reload begins between rendered frames.
+        prepareCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        prepareCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                atlasOwner,
+                "animatedTexturesStates",
+                "Ljava/util/List;"));
+        prepareCode.add(new VarInsnNode(Opcodes.ASTORE, 1));
+        prepareCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        prepareCode.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "java/util/List",
+                "of",
+                "()Ljava/util/List;",
+                true));
+        prepareCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD,
+                atlasOwner,
+                "animatedTexturesStates",
+                "Ljava/util/List;"));
+        prepareCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        prepareCode.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/List",
+                "iterator",
+                "()Ljava/util/Iterator;",
+                true));
+        prepareCode.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        prepareCode.add(animationLoop);
+        prepareCode.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        prepareCode.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Iterator",
+                "hasNext",
+                "()Z",
+                true));
+        prepareCode.add(new JumpInsnNode(Opcodes.IFEQ, animationsDone));
+        prepareCode.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        prepareCode.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Iterator",
+                "next",
+                "()Ljava/lang/Object;",
+                true));
+        prepareCode.add(new TypeInsnNode(
+                Opcodes.CHECKCAST,
+                "net/minecraft/client/renderer/texture/SpriteContents$AnimationState"));
+        prepareCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/renderer/texture/SpriteContents$AnimationState",
+                "close",
+                "()V",
+                false));
+        prepareCode.add(new JumpInsnNode(Opcodes.GOTO, animationLoop));
+        prepareCode.add(animationsDone);
+        prepareCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        prepareCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                atlasOwner,
+                "spriteUbos",
+                "Lcom/mojang/blaze3d/buffers/GpuBuffer;"));
+        prepareCode.add(new JumpInsnNode(Opcodes.IFNULL, spriteUboDone));
+        prepareCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        prepareCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                atlasOwner,
+                "spriteUbos",
+                "Lcom/mojang/blaze3d/buffers/GpuBuffer;"));
+        prepareCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "com/mojang/blaze3d/buffers/GpuBuffer",
+                "close",
+                "()V",
+                false));
+        prepareCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        prepareCode.add(new InsnNode(Opcodes.ACONST_NULL));
+        prepareCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD,
+                atlasOwner,
+                "spriteUbos",
+                "Lcom/mojang/blaze3d/buffers/GpuBuffer;"));
+        prepareCode.add(spriteUboDone);
+        prepareCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        prepareCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                atlasOwner,
+                "browserReleaseOldSpriteImagesBeforeReload",
+                "()V",
+                false));
+        prepareCode.add(new InsnNode(Opcodes.RETURN));
+        prepareForReload.maxStack = 1;
+        prepareForReload.maxLocals = 3;
+        atlas.methods.add(prepareForReload);
+
         MethodNode atlasUpload = find(
                 atlas,
                 "upload",
@@ -12939,6 +13048,98 @@ public final class MinecraftClientPatcher {
                     "TextureAtlas uploadInitialContents return shape changed: " + returns);
         }
         writeComputeFrames(atlas, root.resolve(atlasOwner + ".class"));
+
+        String atlasManagerOwner = "net/minecraft/client/resources/model/sprite/AtlasManager";
+        ClassNode atlasManager = read(jar, atlasManagerOwner + ".class");
+        if (findNullable(atlasManager, "browserReleaseAtlasImagesBeforeReload", "()V") != null) {
+            throw new IOException("AtlasManager pre-reload image release helper already exists");
+        }
+        MethodNode releaseAtlasImages = new MethodNode(
+                Opcodes.ACC_PRIVATE,
+                "browserReleaseAtlasImagesBeforeReload",
+                "()V",
+                null,
+                null);
+        LabelNode atlasManagerLoop = new LabelNode();
+        LabelNode atlasManagerDone = new LabelNode();
+        InsnList atlasManagerReleaseCode = releaseAtlasImages.instructions;
+        atlasManagerReleaseCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        atlasManagerReleaseCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                atlasManagerOwner,
+                "atlasById",
+                "Ljava/util/Map;"));
+        atlasManagerReleaseCode.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Map",
+                "values",
+                "()Ljava/util/Collection;",
+                true));
+        atlasManagerReleaseCode.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Collection",
+                "iterator",
+                "()Ljava/util/Iterator;",
+                true));
+        atlasManagerReleaseCode.add(new VarInsnNode(Opcodes.ASTORE, 1));
+        atlasManagerReleaseCode.add(atlasManagerLoop);
+        atlasManagerReleaseCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        atlasManagerReleaseCode.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Iterator",
+                "hasNext",
+                "()Z",
+                true));
+        atlasManagerReleaseCode.add(new JumpInsnNode(Opcodes.IFEQ, atlasManagerDone));
+        atlasManagerReleaseCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        atlasManagerReleaseCode.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Iterator",
+                "next",
+                "()Ljava/lang/Object;",
+                true));
+        atlasManagerReleaseCode.add(new TypeInsnNode(
+                Opcodes.CHECKCAST,
+                atlasManagerOwner + "$AtlasEntry"));
+        atlasManagerReleaseCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                atlasManagerOwner + "$AtlasEntry",
+                "atlas",
+                "()Lnet/minecraft/client/renderer/texture/TextureAtlas;",
+                false));
+        atlasManagerReleaseCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                atlasOwner,
+                "browserPrepareForSpriteReload",
+                "()V",
+                false));
+        atlasManagerReleaseCode.add(new JumpInsnNode(Opcodes.GOTO, atlasManagerLoop));
+        atlasManagerReleaseCode.add(atlasManagerDone);
+        atlasManagerReleaseCode.add(new InsnNode(Opcodes.RETURN));
+        releaseAtlasImages.maxStack = 1;
+        releaseAtlasImages.maxLocals = 2;
+        atlasManager.methods.add(releaseAtlasImages);
+
+        MethodNode atlasManagerReload = find(
+                atlasManager,
+                "reload",
+                "(Lnet/minecraft/server/packs/resources/PreparableReloadListener$SharedState;"
+                        + "Ljava/util/concurrent/Executor;"
+                        + "Lnet/minecraft/server/packs/resources/"
+                        + "PreparableReloadListener$PreparationBarrier;"
+                        + "Ljava/util/concurrent/Executor;)Ljava/util/concurrent/CompletableFuture;");
+        InsnList releaseBeforePreparation = new InsnList();
+        releaseBeforePreparation.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        releaseBeforePreparation.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                atlasManagerOwner,
+                "browserReleaseAtlasImagesBeforeReload",
+                "()V",
+                false));
+        atlasManagerReload.instructions.insertBefore(
+                atlasManagerReload.instructions.getFirst(), releaseBeforePreparation);
+        atlasManagerReload.maxStack = Math.max(atlasManagerReload.maxStack, 1);
+        writeComputeFrames(atlasManager, root.resolve(atlasManagerOwner + ".class"));
         System.out.println("Released 26.2 static sprite NativeImages after atlas upload");
     }
 

@@ -1039,10 +1039,41 @@ try {
       < atlasUpload.indexOf("Method createTexture:(III)V"),
   "26.2 atlas reload must release old sprite images before allocating the replacement atlas");
   const atlasOldRelease = method(patchedTextureAtlas,
-    "private void browserReleaseOldSpriteImagesBeforeReload();");
+    "private void browserReleaseOldSpriteImagesBeforeReload();",
+    "public void browserPrepareForSpriteReload();");
   assert.equal(occurrences(atlasOldRelease,
     "SpriteContents.browserReleaseAllImagesBeforeReload"), 1,
   "26.2 old atlas release helper must visit every previous sprite contents object");
+  const atlasPrepareForReload = method(patchedTextureAtlas,
+    "public void browserPrepareForSpriteReload();");
+  assert.equal(occurrences(atlasPrepareForReload,
+    "SpriteContents$AnimationState.close"), 1,
+  "26.2 pre-reload helper must close every detached animation state");
+  assert.equal(occurrences(atlasPrepareForReload,
+    "GpuBuffer.close"), 1,
+  "26.2 pre-reload helper must close the old animated-sprite UBO");
+  assert.equal(occurrences(atlasPrepareForReload,
+    "browserReleaseOldSpriteImagesBeforeReload"), 1,
+  "26.2 pre-reload helper must release old sprite CPU images exactly once");
+  const detachAnimationStates = atlasPrepareForReload.lastIndexOf(
+    "Field animatedTexturesStates:Ljava/util/List;");
+  const closeAnimationStates = atlasPrepareForReload.indexOf(
+    "SpriteContents$AnimationState.close");
+  const closeSpriteUbo = atlasPrepareForReload.indexOf("GpuBuffer.close");
+  const nullSpriteUbo = atlasPrepareForReload.indexOf(
+    "Field spriteUbos:Lcom/mojang/blaze3d/buffers/GpuBuffer;", closeSpriteUbo + 1);
+  const releaseOldSpriteImages = atlasPrepareForReload.indexOf(
+    "browserReleaseOldSpriteImagesBeforeReload");
+  assert.ok(detachAnimationStates >= 0
+      && closeAnimationStates > detachAnimationStates
+      && closeSpriteUbo > closeAnimationStates
+      && nullSpriteUbo > closeSpriteUbo
+      && releaseOldSpriteImages > nullSpriteUbo,
+  "26.2 pre-reload helper must detach animation ticks, close animation GPU state, "
+      + "null the sprite UBO, then release old CPU images");
+  assert.match(atlasPrepareForReload,
+    /aconst_null\s+\d+: putfield\s+#[0-9]+\s+\/\/ Field spriteUbos:Lcom\/mojang\/blaze3d\/buffers\/GpuBuffer;/,
+  "26.2 pre-reload helper must null the closed sprite UBO");
 
   const patchedAtlasManager = execFileSync(javap, ["-classpath", clientJar,
     "-p", "-c", "net.minecraft.client.resources.model.sprite.AtlasManager"], {
@@ -1060,6 +1091,22 @@ try {
   assert.match(updateMaxMipLevel,
     /iconst_0\s+\d+: putfield\s+#[0-9]+\s+\/\/ Field maxMipmapLevels:I/,
     "26.2 browser AtlasManager updates must preserve the zero-mipmap cap");
+  const atlasManagerReload = method(patchedAtlasManager,
+    "public java.util.concurrent.CompletableFuture<java.lang.Void> reload(",
+    "private void updateSpriteMaps(");
+  assert.equal(occurrences(atlasManagerReload,
+    "browserReleaseAtlasImagesBeforeReload"), 1,
+  "26.2 atlas manager must release retained images once before preparing replacements");
+  const atlasManagerReloadInstructions = bytecodeInstructions(atlasManagerReload);
+  assert.ok(atlasManagerReloadInstructions[0]?.instruction === "aload_0"
+      && atlasManagerReloadInstructions[1]?.instruction
+        .includes("browserReleaseAtlasImagesBeforeReload"),
+  "26.2 atlas manager must release old images before any replacement atlas load is scheduled");
+  const atlasManagerRelease = method(patchedAtlasManager,
+    "private void browserReleaseAtlasImagesBeforeReload();");
+  assert.equal(occurrences(atlasManagerRelease,
+    "TextureAtlas.browserPrepareForSpriteReload"), 1,
+  "26.2 atlas manager release helper must visit every existing atlas");
 
   // Verify the client crack overlay probe was inserted into the actual ASM
   // methods, rather than merely checking source names or patcher strings.
