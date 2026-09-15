@@ -70,7 +70,6 @@ public final class Minecraft262BrowserPatcher {
         patchFramerateLimiter(jar, root);
         patchGraphicsPresetBrowserDistances(jar, root);
         patchAtlasManagerBrowserMipmapCap(jar, root);
-        patchAtlasManagerPendingStitchLifecycle(jar, root);
         patchChunkGenerationCooperation(jar, root);
         patchDistanceManagerCooperation(jar, root);
         patchServerChunkBroadcastCooperation(jar, root);
@@ -137,76 +136,6 @@ public final class Minecraft262BrowserPatcher {
         replace(update, updateCode, 2, update.maxLocals);
         writeComputeFrames(node, root.resolve(owner + ".class"));
         System.out.println("Capped 26.2 browser atlas mipmaps at level zero");
-    }
-
-    /**
-     * Drop the preparation graph immediately after atlas upload.  The vanilla
-     * reload barrier has already completed at this point and no later path
-     * reads PendingStitchResults' preparation containers.  Keeping the list,
-     * per-atlas futures, and allOf future alive retains every decoded sprite
-     * until the whole reload state is collected, which is a large browser
-     * native-memory spike for resource packs.  The allOf future is final and
-     * remains as a completed, small object; the large preparation containers
-     * are the retention source we can safely clear here.
-     */
-    private static void patchAtlasManagerPendingStitchLifecycle(String jar, Path root)
-            throws IOException {
-        String owner =
-                "net/minecraft/client/resources/model/sprite/AtlasManager$PendingStitchResults";
-        Path output = root.resolve(owner + ".class");
-        ClassNode node;
-        if (Files.exists(output)) {
-            node = new ClassNode();
-            new ClassReader(Files.readAllBytes(output)).accept(node, 0);
-        } else {
-            node = read(jar, owner + ".class");
-        }
-
-        MethodNode join = find(
-                node,
-                "joinAndUpload",
-                "()Ljava/util/Map;");
-        int returns = 0;
-        int cleanupCalls = 0;
-        for (AbstractInsnNode instruction : join.instructions.toArray()) {
-            if (instruction.getOpcode() != Opcodes.ARETURN) {
-                continue;
-            }
-            InsnList cleanup = new InsnList();
-            cleanup.add(new VarInsnNode(Opcodes.ALOAD, 0));
-            cleanup.add(new FieldInsnNode(
-                    Opcodes.GETFIELD,
-                    owner,
-                    "pendingStitches",
-                    "Ljava/util/List;"));
-            cleanup.add(new MethodInsnNode(
-                    Opcodes.INVOKEINTERFACE,
-                    "java/util/List",
-                    "clear",
-                    "()V",
-                    true));
-            cleanup.add(new VarInsnNode(Opcodes.ALOAD, 0));
-            cleanup.add(new FieldInsnNode(
-                    Opcodes.GETFIELD,
-                    owner,
-                    "stitchFuturesById",
-                    "Ljava/util/Map;"));
-            cleanup.add(new MethodInsnNode(
-                    Opcodes.INVOKEINTERFACE,
-                    "java/util/Map",
-                    "clear",
-                    "()V",
-                    true));
-            join.instructions.insertBefore(instruction, cleanup);
-            returns++;
-            cleanupCalls += 2;
-        }
-        requireOne(owner + " joinAndUpload return cleanup", returns);
-        join.maxStack = Math.max(join.maxStack, 2);
-        writeComputeFrames(node, output);
-        System.out.println(
-                "Released 26.2 atlas PendingStitch containers after upload (" + cleanupCalls
-                        + " cleanup calls)");
     }
 
     /**

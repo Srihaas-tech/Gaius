@@ -8590,6 +8590,14 @@ def check_overlay_bytecode() -> None:
         browser_integrated_server_main_class,
         "private static boolean drainUrgentPackets();",
     )
+    browser_drain_scheduled_network_input = method_section(
+        browser_integrated_server_main_class,
+        "private static boolean drainScheduledNetworkInput();",
+    )
+    browser_drain_urgent_packets_from_server_loop = method_section(
+        browser_integrated_server_main_class,
+        "private static boolean drainUrgentPacketsFromServerLoop(net.minecraft.server.MinecraftServer);",
+    )
     browser_pump_pending_packets = method_section(
         browser_integrated_server_main_class,
         "public static void pumpUrgentPacketsIfPending();",
@@ -8613,6 +8621,10 @@ def check_overlay_bytecode() -> None:
     blockable_event_loop_schedule = method_section(
         blockable_event_loop,
         "public void schedule(R);",
+    )
+    blockable_event_loop_do_run_task = method_section(
+        blockable_event_loop,
+        "protected void doRunTask(R);",
     )
     browser_gzip_read_nbt = method_section(
         browser_gzip_class,
@@ -11808,10 +11820,21 @@ def check_overlay_bytecode() -> None:
             and "TModernRuntimeSupport.yieldToEventLoop:(I)V"
                 in worldgen_yield_reentrant
             and "Method drainUrgentPackets:()Z" in browser_pump_urgent_packets
-            and "BrowserClientNetwork.pumpBrowserChannelsAtFrameBoundary"
+            and "Method drainUrgentPacketsFromServerLoop:(Lnet/minecraft/server/MinecraftServer;)Z"
                 in browser_drain_urgent_packets
-            and "MinecraftServer.packetProcessor" in browser_drain_urgent_packets
-            and "PacketProcessor.processQueuedPackets" in browser_drain_urgent_packets,
+            and "BrowserClientNetwork.pumpBrowserChannelsAtFrameBoundary"
+                in browser_drain_urgent_packets_from_server_loop
+            and "MinecraftServer.packetProcessor" in browser_drain_urgent_packets_from_server_loop
+            and "PacketProcessor.processQueuedPackets" in browser_drain_urgent_packets_from_server_loop,
+        ),
+        (
+            "Scheduled network input uses its lifecycle permit without a TeaVM thread-wrapper check",
+            "MinecraftServer.isRunning" in browser_drain_scheduled_network_input
+            and "NETWORK_INPUT_TASK_SCHEDULED" in browser_drain_scheduled_network_input
+            and "activeNetworkInputTask" in browser_drain_scheduled_network_input
+            and "Method drainUrgentPacketsFromServerLoop:(Lnet/minecraft/server/MinecraftServer;)Z"
+                in browser_drain_scheduled_network_input
+            and "java/lang/Thread.currentThread" not in browser_drain_scheduled_network_input,
         ),
         (
             "Integrated server pumps pending input while awaiting chunk futures",
@@ -11840,8 +11863,9 @@ def check_overlay_bytecode() -> None:
             and "MinecraftServer.schedule" in browser_schedule_network_input
             and "MinecraftServer.execute" not in browser_schedule_network_input
             and "LockSupport.unpark" in browser_schedule_network_input
-            and "Method drainUrgentPackets:()Z" in browser_run_scheduled_network_input
+            and "Method drainScheduledNetworkInput:()Z" in browser_run_scheduled_network_input
             and "Method reportRuntimeEvent" in browser_run_scheduled_network_input
+            and "BrowserIntegratedServerMain.beginScheduledNetworkInputTask" not in browser_run_scheduled_network_input
             and "java/util/Queue.add" in blockable_event_loop_schedule
             and "Method getRunningThread" in blockable_event_loop_schedule
             and "java/util/concurrent/locks/LockSupport.unpark"
@@ -11849,6 +11873,19 @@ def check_overlay_bytecode() -> None:
             and "java/lang/Runnable.run" not in blockable_event_loop_schedule
             and "Method doRunTask" not in blockable_event_loop_schedule
             and "Method execute" not in blockable_event_loop_schedule,
+        ),
+        (
+            "BlockableEventLoop dispatches the private network task with an identity lease",
+            "BrowserIntegratedServerMain.beginScheduledNetworkInputTask"
+                in blockable_event_loop_do_run_task
+            and "java/lang/Runnable.run" in blockable_event_loop_do_run_task
+            and blockable_event_loop_do_run_task.find(
+                "BrowserIntegratedServerMain.beginScheduledNetworkInputTask"
+            )
+                < blockable_event_loop_do_run_task.find("java/lang/Runnable.run")
+            and blockable_event_loop_do_run_task.count(
+                "BrowserIntegratedServerMain.endScheduledNetworkInputTask"
+            ) >= 2,
         ),
         (
             "Compiled structure templates retain synchronous NBT parsing with direct byte-array reads",

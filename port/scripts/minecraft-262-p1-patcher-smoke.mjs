@@ -1115,22 +1115,10 @@ try {
   const pendingJoinAndUpload = method(patchedPendingStitches,
     "public java.util.Map<net.minecraft.client.resources.model.sprite.SpriteId, net.minecraft.client.renderer.texture.TextureAtlasSprite> joinAndUpload();",
     "public java.util.concurrent.CompletableFuture<net.minecraft.client.renderer.texture.SpriteLoader$Preparations> get(");
-  assert.equal(occurrences(pendingJoinAndUpload, "java/util/List.clear:()V"), 1,
-    "26.2 atlas upload must clear the pending stitch list exactly once");
-  assert.equal(occurrences(pendingJoinAndUpload, "java/util/Map.clear:()V"), 1,
-    "26.2 atlas upload must clear the preparation-future map exactly once");
-  const pendingJoinInstructions = bytecodeInstructions(pendingJoinAndUpload);
-  const resultLoad = pendingJoinInstructions.findLastIndex(({instruction}) =>
-    instruction === "aload_1");
-  const listClear = pendingJoinInstructions.findIndex(({instruction}) =>
-    instruction.includes("java/util/List.clear:()V"));
-  const mapClear = pendingJoinInstructions.findIndex(({instruction}) =>
-    instruction.includes("java/util/Map.clear:()V"));
-  const resultReturn = pendingJoinInstructions.findIndex(({instruction}) =>
-    instruction === "areturn");
-  assert.ok(resultLoad >= 0 && listClear > resultLoad && mapClear > listClear
-      && resultReturn > mapClear,
-    "26.2 atlas upload must retain its result, clear both preparation containers, then return");
+  assert.equal(occurrences(pendingJoinAndUpload, "java/util/List.clear:()V"), 0,
+    "26.2 atlas upload must not invalidate shared reload state before all listeners finish");
+  assert.equal(occurrences(pendingJoinAndUpload, "java/util/Map.clear:()V"), 0,
+    "26.2 atlas upload must retain futures queried through PendingStitchResults.get");
 
   // Verify the client crack overlay probe was inserted into the actual ASM
   // methods, rather than merely checking source names or patcher strings.
@@ -1367,6 +1355,27 @@ try {
   const patched121PacketProcessor = execFileSync(javap, [
     "-classpath", generic121Jar, "-p", "-c", "net.minecraft.network.PacketProcessor",
   ], {encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000});
+  const patchedBlockableEventLoop = execFileSync(javap, [
+    "-classpath", clientJar, "-p", "-c", "net.minecraft.util.thread.BlockableEventLoop",
+  ], {encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000});
+  const patched121BlockableEventLoop = execFileSync(javap, [
+    "-classpath", generic121Jar, "-p", "-c", "net.minecraft.util.thread.BlockableEventLoop",
+  ], {encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000});
+  for (const [profileId, blockableEventLoop] of [
+    ["26.2", patchedBlockableEventLoop],
+    ["1.21.11", patched121BlockableEventLoop],
+  ]) {
+    const doRunTask = method(blockableEventLoop,
+      "protected void doRunTask(R);", "public void schedule(R);");
+    const begin = doRunTask.indexOf(
+      "BrowserIntegratedServerMain.beginScheduledNetworkInputTask");
+    const taskRun = doRunTask.indexOf("java/lang/Runnable.run");
+    assert.ok(begin >= 0 && taskRun > begin,
+      `${profileId} doRunTask must acquire the exact network-task lease before dispatch`);
+    assert.equal(occurrences(doRunTask,
+      "BrowserIntegratedServerMain.endScheduledNetworkInputTask"), 2,
+    `${profileId} doRunTask must release the network-task lease on return and exception`);
+  }
   assertPacketProcessorQueueContract(patchedPacketProcessor, "26.2");
   assertPacketProcessorQueueContract(patched121PacketProcessor, "1.21.11");
   assertPacketProcessorLifecycleContract(patchedPacketProcessor, "26.2");

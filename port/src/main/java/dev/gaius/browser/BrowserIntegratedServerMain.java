@@ -43,6 +43,10 @@ public final class BrowserIntegratedServerMain {
     private static boolean distanceAdvancePending;
     private static boolean urgentPacketPumpActive;
     private static final AtomicBoolean NETWORK_INPUT_TASK_SCHEDULED = new AtomicBoolean();
+    /** Exact TickTask instance currently owned by the browser network wakeup permit. */
+    private static Runnable scheduledNetworkInputTask;
+    /** Short lease held only while BlockableEventLoop.doRunTask dispatches that exact instance. */
+    private static Runnable activeNetworkInputTask;
     private static boolean networkInputBurstActive;
     private static int networkInputFollowupsRemaining;
     private static int networkInputDeferredRetriesRemaining;
@@ -128,6 +132,8 @@ public final class BrowserIntegratedServerMain {
         distanceAdvancePending = false;
         urgentPacketPumpActive = false;
         NETWORK_INPUT_TASK_SCHEDULED.set(false);
+        scheduledNetworkInputTask = null;
+        activeNetworkInputTask = null;
         networkInputBurstActive = false;
         networkInputFollowupsRemaining = 0;
         networkInputDeferredRetriesRemaining = 0;
@@ -298,6 +304,56 @@ public final class BrowserIntegratedServerMain {
                 || urgentPacketPumpActive) {
             return false;
         }
+        return drainUrgentPacketsFromServerLoop(current);
+    }
+
+    /**
+     * Drains the private task enqueued through {@link MinecraftServer#schedule}.
+     *
+     * <p>TeaVM may resume a queued {@link TickTask} with a different Java {@link Thread} wrapper
+     * even though {@code BlockableEventLoop.pollTask} is consuming that task on the integrated
+     * server loop. The private runnable reference is the execution capability here: JavaScript
+     * wakeups can only enqueue it and cannot call this method. Keep lifecycle and one-task permit
+     * checks, but do not reject a genuine scheduled task solely because its wrapper identity
+     * differs from the one observed at the patched {@code pollTask} boundary.</p>
+     */
+    private static boolean drainScheduledNetworkInput() {
+        MinecraftServer current = server;
+        if (!isWorkerRuntime() || current == null || serverThreadExited || !current.isRunning()
+                || !NETWORK_INPUT_TASK_SCHEDULED.get() || activeNetworkInputTask == null
+                || urgentPacketPumpActive) {
+            return false;
+        }
+        return drainUrgentPacketsFromServerLoop(current);
+    }
+
+    /**
+     * Called by the patched BlockableEventLoop.doRunTask immediately before dispatching a queued
+     * runnable. Object identity, not TeaVM's Thread wrapper identity, proves that this is our
+     * private TickTask. The caller must pair this with endScheduledNetworkInputTask in finally.
+     */
+    public static boolean beginScheduledNetworkInputTask(Runnable task) {
+        MinecraftServer current = server;
+        if (!isWorkerRuntime() || current == null || serverThreadExited || !current.isRunning()
+                || !NETWORK_INPUT_TASK_SCHEDULED.get() || task == null
+                || task != scheduledNetworkInputTask || activeNetworkInputTask != null) {
+            return false;
+        }
+        activeNetworkInputTask = task;
+        return true;
+    }
+
+    /** Releases the exact-dispatch lease, including when the queued runnable throws. */
+    public static void endScheduledNetworkInputTask(Runnable task, boolean entered) {
+        if (entered && activeNetworkInputTask == task) {
+            activeNetworkInputTask = null;
+            if (scheduledNetworkInputTask == task) {
+                scheduledNetworkInputTask = null;
+            }
+        }
+    }
+
+    private static boolean drainUrgentPacketsFromServerLoop(MinecraftServer current) {
         urgentPacketPumpActive = true;
         try {
             BrowserClientNetwork.pumpBrowserChannelsAtFrameBoundary();
@@ -385,7 +441,9 @@ public final class BrowserIntegratedServerMain {
             // MinecraftServer.shouldRun delays current-tick tasks whenever worldgen exhausts the
             // tick budget. Mark this internal pump as overdue so player input cannot starve while
             // the server is waiting on chunk work; execution still remains on the server thread.
-            current.schedule(new TickTask(Integer.MIN_VALUE, NETWORK_INPUT_TASK));
+            TickTask task = new TickTask(Integer.MIN_VALUE, NETWORK_INPUT_TASK);
+            scheduledNetworkInputTask = task;
+            current.schedule(task);
             // Vanilla schedule wakes after enqueueing. Keep an explicit post-enqueue wake here so
             // this browser-specific contract does not depend on an incidental scheduler detail.
             LockSupport.unpark(currentServerThread);
@@ -397,6 +455,8 @@ public final class BrowserIntegratedServerMain {
             return true;
         } catch (RuntimeException | Error exception) {
             NETWORK_INPUT_TASK_SCHEDULED.set(false);
+            scheduledNetworkInputTask = null;
+            activeNetworkInputTask = null;
             recordNetworkPumpState(4, false);
             reportRuntimeEvent("network-pump-schedule-error", String.valueOf(exception));
             return false;
@@ -406,12 +466,12 @@ public final class BrowserIntegratedServerMain {
     private static void runScheduledNetworkInput() {
         boolean pumped = false;
         try {
-            pumped = drainUrgentPackets();
+            pumped = drainScheduledNetworkInput();
             if (!pumped) {
                 recordNetworkPumpState(8, true);
                 reportRuntimeEvent(
-                        "network-pump-wrong-thread",
-                        "Scheduled input task did not run on the integrated server thread");
+                    "network-pump-wrong-thread",
+                    "Scheduled input task lost its integrated server lifecycle permit");
             }
         } catch (RuntimeException | Error exception) {
             reportRuntimeEvent("network-pump-error", String.valueOf(exception));
@@ -779,6 +839,8 @@ public final class BrowserIntegratedServerMain {
             appliedSimulationDistance = Integer.MIN_VALUE;
             finishNetworkInputBurst();
             NETWORK_INPUT_TASK_SCHEDULED.set(false);
+            scheduledNetworkInputTask = null;
+            activeNetworkInputTask = null;
             recordNetworkPumpState(-1, false);
             recordNetworkInputPending(false);
             if (isWorkerRuntime()) {

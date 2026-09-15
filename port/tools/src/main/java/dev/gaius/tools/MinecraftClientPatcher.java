@@ -10003,11 +10003,49 @@ public final class MinecraftClientPatcher {
     private static void patchBlockableEventLoopBrowser(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/util/thread/BlockableEventLoop.class");
         MethodNode method = find(node, "doRunTask", "(Ljava/lang/Runnable;)V");
+        LabelNode start = new LabelNode();
+        LabelNode end = new LabelNode();
+        LabelNode handler = new LabelNode();
+        int enteredLocal = 2;
+        int throwableLocal = 3;
         InsnList code = new InsnList();
         code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserIntegratedServerMain",
+                "beginScheduledNetworkInputTask",
+                "(Ljava/lang/Runnable;)Z",
+                false));
+        code.add(new VarInsnNode(Opcodes.ISTORE, enteredLocal));
+        code.add(start);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new MethodInsnNode(Opcodes.INVOKEINTERFACE, "java/lang/Runnable", "run", "()V", true));
+        code.add(end);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new VarInsnNode(Opcodes.ILOAD, enteredLocal));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserIntegratedServerMain",
+                "endScheduledNetworkInputTask",
+                "(Ljava/lang/Runnable;Z)V",
+                false));
         code.add(new InsnNode(Opcodes.RETURN));
-        replace(method, code, 1, 2);
+        code.add(handler);
+        code.add(new VarInsnNode(Opcodes.ASTORE, throwableLocal));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new VarInsnNode(Opcodes.ILOAD, enteredLocal));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserIntegratedServerMain",
+                "endScheduledNetworkInputTask",
+                "(Ljava/lang/Runnable;Z)V",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, throwableLocal));
+        code.add(new InsnNode(Opcodes.ATHROW));
+        replace(method, code, 2, 4);
+        method.tryCatchBlocks.clear();
+        method.tryCatchBlocks.add(new TryCatchBlockNode(start, end, handler, "java/lang/Throwable"));
+        method.maxStack = Math.max(method.maxStack, 2);
         writeComputeFrames(node, output);
     }
 
