@@ -992,7 +992,7 @@ try {
     });
   const staticImageRelease = method(patchedSpriteContents,
     "public void browserReleaseStaticImagesAfterUpload();",
-    "public java.lang.String toString();");
+    "public void browserReleaseAllImagesBeforeReload();");
   assert.equal(occurrences(staticImageRelease,
     "NativeImage.close"), 1,
   "26.2 static sprite release must close every retained native mip image");
@@ -1000,6 +1000,16 @@ try {
     "26.2 static sprite release lost its animation guard");
   assert.match(staticImageRelease, /anewarray\s+#[0-9]+\s+\/\/ class com\/mojang\/blaze3d\/platform\/NativeImage/,
     "26.2 static sprite release must detach the closed mip array");
+  const allImageRelease = method(patchedSpriteContents,
+    "public void browserReleaseAllImagesBeforeReload();",
+    "public java.lang.String toString();");
+  assert.equal(occurrences(allImageRelease,
+    "NativeImage.close"), 1,
+  "26.2 pre-reload sprite release must close every retained native mip image");
+  assert.doesNotMatch(allImageRelease, /Field animatedTexture/,
+    "26.2 pre-reload sprite release must include animated sprites");
+  assert.match(allImageRelease, /anewarray\s+#[0-9]+\s+\/\/ class com\/mojang\/blaze3d\/platform\/NativeImage/,
+    "26.2 pre-reload sprite release must detach the closed mip array");
 
   const patchedTextureAtlas = execFileSync(javap, ["-classpath", clientJar,
     "-p", "-c", "net.minecraft.client.renderer.texture.TextureAtlas"], {
@@ -1019,6 +1029,20 @@ try {
   assert.equal(occurrences(atlasStaticRelease,
     "SpriteContents.browserReleaseStaticImagesAfterUpload"), 1,
   "26.2 atlas static release helper must visit every sprite contents object");
+  const atlasUpload = method(patchedTextureAtlas,
+    "public void upload(net.minecraft.client.renderer.texture.SpriteLoader$Preparations);",
+    "private void uploadInitialContents();");
+  assert.equal(occurrences(atlasUpload,
+    "browserReleaseOldSpriteImagesBeforeReload"), 1,
+  "26.2 atlas reload must release old sprite images exactly once");
+  assert.ok(atlasUpload.indexOf("browserReleaseOldSpriteImagesBeforeReload")
+      < atlasUpload.indexOf("Method createTexture:(III)V"),
+  "26.2 atlas reload must release old sprite images before allocating the replacement atlas");
+  const atlasOldRelease = method(patchedTextureAtlas,
+    "private void browserReleaseOldSpriteImagesBeforeReload();");
+  assert.equal(occurrences(atlasOldRelease,
+    "SpriteContents.browserReleaseAllImagesBeforeReload"), 1,
+  "26.2 old atlas release helper must visit every previous sprite contents object");
 
   const patchedAtlasManager = execFileSync(javap, ["-classpath", clientJar,
     "-p", "-c", "net.minecraft.client.resources.model.sprite.AtlasManager"], {

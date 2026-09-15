@@ -12730,6 +12730,56 @@ public final class MinecraftClientPatcher {
         release.maxStack = 2;
         release.maxLocals = 4;
         sprite.methods.add(release);
+
+        MethodNode releaseAllImages = new MethodNode(
+                Opcodes.ACC_PUBLIC,
+                "browserReleaseAllImagesBeforeReload",
+                "()V",
+                null,
+                null);
+        LabelNode releaseAllLoop = new LabelNode();
+        LabelNode releaseAllNext = new LabelNode();
+        InsnList releaseAllImagesCode = releaseAllImages.instructions;
+        releaseAllImagesCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        releaseAllImagesCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                spriteOwner,
+                "byMipLevel",
+                "[Lcom/mojang/blaze3d/platform/NativeImage;"));
+        releaseAllImagesCode.add(new VarInsnNode(Opcodes.ASTORE, 1));
+        releaseAllImagesCode.add(new InsnNode(Opcodes.ICONST_0));
+        releaseAllImagesCode.add(new VarInsnNode(Opcodes.ISTORE, 2));
+        releaseAllImagesCode.add(releaseAllLoop);
+        releaseAllImagesCode.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        releaseAllImagesCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        releaseAllImagesCode.add(new InsnNode(Opcodes.ARRAYLENGTH));
+        releaseAllImagesCode.add(new JumpInsnNode(Opcodes.IF_ICMPGE, releaseAllNext));
+        releaseAllImagesCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        releaseAllImagesCode.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        releaseAllImagesCode.add(new InsnNode(Opcodes.AALOAD));
+        releaseAllImagesCode.add(new VarInsnNode(Opcodes.ASTORE, 3));
+        LabelNode releaseAllSkipNull = new LabelNode();
+        releaseAllImagesCode.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        releaseAllImagesCode.add(new JumpInsnNode(Opcodes.IFNULL, releaseAllSkipNull));
+        releaseAllImagesCode.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        releaseAllImagesCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, imageOwner, "close", "()V", false));
+        releaseAllImagesCode.add(releaseAllSkipNull);
+        releaseAllImagesCode.add(new IincInsnNode(2, 1));
+        releaseAllImagesCode.add(new JumpInsnNode(Opcodes.GOTO, releaseAllLoop));
+        releaseAllImagesCode.add(releaseAllNext);
+        releaseAllImagesCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        releaseAllImagesCode.add(new InsnNode(Opcodes.ICONST_0));
+        releaseAllImagesCode.add(new TypeInsnNode(Opcodes.ANEWARRAY, imageOwner));
+        releaseAllImagesCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD,
+                spriteOwner,
+                "byMipLevel",
+                "[Lcom/mojang/blaze3d/platform/NativeImage;"));
+        releaseAllImagesCode.add(new InsnNode(Opcodes.RETURN));
+        releaseAllImages.maxStack = 2;
+        releaseAllImages.maxLocals = 4;
+        sprite.methods.add(releaseAllImages);
         writeComputeFrames(sprite, root.resolve(spriteOwner + ".class"));
 
         String atlasOwner = "net/minecraft/client/renderer/texture/TextureAtlas";
@@ -12793,6 +12843,78 @@ public final class MinecraftClientPatcher {
         releaseAll.maxStack = 1;
         releaseAll.maxLocals = 2;
         atlas.methods.add(releaseAll);
+
+        MethodNode releaseOld = new MethodNode(
+                Opcodes.ACC_PRIVATE,
+                "browserReleaseOldSpriteImagesBeforeReload",
+                "()V",
+                null,
+                null);
+        LabelNode oldLoop = new LabelNode();
+        LabelNode oldDone = new LabelNode();
+        InsnList oldCode = releaseOld.instructions;
+        oldCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        oldCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, atlasOwner, "sprites", "Ljava/util/List;"));
+        oldCode.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/List",
+                "iterator",
+                "()Ljava/util/Iterator;",
+                true));
+        oldCode.add(new VarInsnNode(Opcodes.ASTORE, 1));
+        oldCode.add(oldLoop);
+        oldCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        oldCode.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Iterator",
+                "hasNext",
+                "()Z",
+                true));
+        oldCode.add(new JumpInsnNode(Opcodes.IFEQ, oldDone));
+        oldCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        oldCode.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Iterator",
+                "next",
+                "()Ljava/lang/Object;",
+                true));
+        oldCode.add(new TypeInsnNode(
+                Opcodes.CHECKCAST,
+                "net/minecraft/client/renderer/texture/TextureAtlasSprite"));
+        oldCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/renderer/texture/TextureAtlasSprite",
+                "contents",
+                "()Lnet/minecraft/client/renderer/texture/SpriteContents;",
+                false));
+        oldCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                spriteOwner,
+                "browserReleaseAllImagesBeforeReload",
+                "()V",
+                false));
+        oldCode.add(new JumpInsnNode(Opcodes.GOTO, oldLoop));
+        oldCode.add(oldDone);
+        oldCode.add(new InsnNode(Opcodes.RETURN));
+        releaseOld.maxStack = 1;
+        releaseOld.maxLocals = 2;
+        atlas.methods.add(releaseOld);
+
+        MethodNode atlasUpload = find(
+                atlas,
+                "upload",
+                "(Lnet/minecraft/client/renderer/texture/SpriteLoader$Preparations;)V");
+        InsnList releaseOldCall = new InsnList();
+        releaseOldCall.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        releaseOldCall.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                atlasOwner,
+                "browserReleaseOldSpriteImagesBeforeReload",
+                "()V",
+                false));
+        atlasUpload.instructions.insertBefore(atlasUpload.instructions.getFirst(), releaseOldCall);
+        atlasUpload.maxStack = Math.max(atlasUpload.maxStack, 1);
 
         MethodNode upload = find(atlas, "uploadInitialContents", "()V");
         int returns = 0;
