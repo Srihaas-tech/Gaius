@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
@@ -20,14 +21,34 @@ const javaHome = process.env.JAVA_HOME;
 const suffix = process.platform === "win32" ? ".exe" : "";
 const java = javaHome ? join(javaHome, "bin", `java${suffix}`) : `java${suffix}`;
 const javac = javaHome ? join(javaHome, "bin", `javac${suffix}`) : `javac${suffix}`;
+const javap = javaHome ? join(javaHome, "bin", `javap${suffix}`) : `javap${suffix}`;
 const root = mkdtempSync(join(tmpdir(), "gaius-worldgen-priority-"));
 const classes = join(root, "classes");
 mkdirSync(classes, { recursive: true });
 const fixtureDir = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 const compileCp = [jar, ...dependencyClasspath].join(delimiter);
 try {
+  const bytecode = spawnSync(javap,
+    ["-classpath", jar, "-c", "-p", "net.minecraft.util.thread.AbstractConsecutiveExecutor"],
+    { encoding: "utf8", timeout: 30_000 });
+  if (bytecode.error) throw bytecode.error;
+  assert.equal(bytecode.status, 0, bytecode.stderr || "javap failed");
+  const runStart = bytecode.stdout.indexOf("public void run();");
+  const runEnd = bytecode.stdout.indexOf("public void runAll();", runStart);
+  assert.ok(runStart >= 0 && runEnd > runStart, "patched executor run() bytecode missing");
+  const runBytecode = bytecode.stdout.slice(runStart, runEnd);
+  assert.equal((runBytecode.match(/gaius\$registerForExecutionDeferred/g) || []).length, 2,
+    "worldgen success/catch must use exactly two deferred registrations");
+  assert.equal((runBytecode.match(/Method registerForExecution:\(\)V/g) || []).length, 2,
+    "vanilla success/catch registration changed");
+
   const compile = spawnSync(javac, ["--release", "21", "-proc:none", "-classpath", compileCp,
-    "-d", classes, join(fixtureDir, "TModernRuntimeSupport.java"), join(fixtureDir, "WorldgenPriorityJvmFixture.java")],
+    "-d", classes,
+    join(fixtureDir, "PlatformRunnable.java"),
+    join(fixtureDir, "Platform.java"),
+    join(dirname(fixtureDir), "..", "src", "main", "java", "dev", "gaius", "browser",
+      "BrowserWorldgenDispatcherScheduler.java"),
+    join(fixtureDir, "WorldgenPriorityJvmFixture.java")],
     { encoding: "utf8", stdio: "inherit", timeout: 60_000 });
   if (compile.error) throw compile.error;
   if (compile.status !== 0) process.exitCode = compile.status ?? 1;

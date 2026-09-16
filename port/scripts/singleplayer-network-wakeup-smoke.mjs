@@ -85,8 +85,10 @@ assert.match(scheduledDrain, /activeNetworkInputTask == null/,
   "the private scheduled task must hold an exact-dispatch lease");
 assert.doesNotMatch(scheduledDrain, /Thread\.currentThread\(\) != serverThread/,
   "TeaVM Thread wrapper identity must not reject a task consumed by the server queue");
-assert.match(source, /task != scheduledNetworkInputTask/,
-  "only the exact enqueued TickTask may acquire the network-input lease");
+assert.match(source, /task instanceof TickTask/,
+  "only a TickTask may acquire the network-input lease");
+assert.match(source, /tickTask\.getTick\(\) != Integer\.MIN_VALUE/,
+  "only the reserved overdue network TickTask may acquire the network-input lease");
 assert.match(source, /beginScheduledNetworkInputTask\(Runnable task\)/);
 assert.match(source, /endScheduledNetworkInputTask\(Runnable task, boolean entered\)/);
 assert.match(run, /pumped = drainScheduledNetworkInput\(\);/);

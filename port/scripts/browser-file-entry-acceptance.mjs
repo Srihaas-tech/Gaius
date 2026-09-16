@@ -11,7 +11,7 @@ import {createServer} from "node:net";
 import {tmpdir} from "node:os";
 import {basename, dirname, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
-import {analyzeTerrainPng, terrainVisualPass} from "../../tools/terrain-visual-metrics.mjs";
+import {analyzeTerrainPng, decodePng, terrainVisualPass} from "../../tools/terrain-visual-metrics.mjs";
 
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const profilePath = process.env.GAIUS_VERSION_PROFILE_PATH || "port/versions/26.2.json";
@@ -178,32 +178,324 @@ async function clickAt(cdp,x,y){await cdp.send("Input.dispatchMouseEvent",{type:
 async function findWidget(cdp,label,ms=60000){const needle=String(label).toLowerCase();const end=Date.now()+ms;while(Date.now()<end){const v=await evaluate(cdp,`(()=>{const s=window.__gaiusMinecraftState||{};const ws=Array.isArray(s.screenWidgets)?s.screenWidgets:[];const n=${JSON.stringify(needle)};const w=ws.find(x=>x&&x.visible!==false&&x.active!==false&&String(x.text||'').trim().toLowerCase()===n)||ws.find(x=>x&&x.visible!==false&&x.active!==false&&String(x.text||'').toLowerCase().includes(n));const c=document.querySelector('canvas');const r=c&&c.getBoundingClientRect();const z=s.screenSize;if(!w||!r||!z||!z.width||!z.height)return null;return {text:String(w.text||''),x:r.left+(Number(w.x)+Number(w.width)/2)*r.width/Number(z.width),y:r.top+(Number(w.y)+Number(w.height)/2)*r.height/Number(z.height),screen:s.screen||null};})()`);if(v)return v;await sleep(250);}return null;}
 async function clickWidget(cdp,label,ms=60000){const w=await findWidget(cdp,label,ms);if(!w)throw new Error(`visible widget not found: ${label}`);await clickAt(cdp,w.x,w.y);return w;}
 
+async function preferCreativeWorld(cdp) {
+  for (let attempt=0; attempt<4; attempt++) {
+    const widget=await findWidget(cdp,"Game Mode",1500).catch(()=>null);
+    if (!widget) return;
+    const selected=String(widget.text||"").split(":").at(-1).trim().toLowerCase();
+    if (selected==="creative") return;
+    await clickAt(cdp,widget.x,widget.y);
+    await sleep(200);
+  }
+}
+
+const MIN_LOADED_CHUNKS = 4;
+const MIN_LOADED_CHUNK_GROWTH = 2;
+const MIN_MOVEMENT_LOADED_CHUNK_GROWTH = 1;
+const MIN_NEW_CHUNK_EVENTS = 2;
+const MIN_CHUNK_TRAVEL = 2;
+const MIN_CHANGED_PIXEL_RATIO = 0.02;
+const MIN_NORMALIZED_PIXEL_DIFFERENCE = 0.01;
+
+function finite(value, fallback=0) {
+  const number=Number(value);
+  return Number.isFinite(number)?number:fallback;
+}
+
+function playerChunk(player) {
+  if(!player||!Number.isFinite(Number(player.x))||!Number.isFinite(Number(player.z)))return null;
+  return {x:Math.floor(Number(player.x)/16),z:Math.floor(Number(player.z)/16)};
+}
+
+function chunkTravel(start,end) {
+  if(!start||!end)return 0;
+  return Math.max(Math.abs(end.x-start.x),Math.abs(end.z-start.z));
+}
+
+function playerTravel(start,end) {
+  if(!start||!end)return 0;
+  return Math.hypot(finite(end.x)-finite(start.x),finite(end.z)-finite(start.z));
+}
+
+function failureEvents(events) {
+  return (Array.isArray(events)?events:[]).filter(entry=>{
+    const event=String(entry?.event||"").toLowerCase();
+    const type=String(entry?.detail?.type||"").toLowerCase();
+    const serialized=JSON.stringify(entry||{}).toLowerCase();
+    return (event.startsWith("singleplayer:")
+        &&/(?:error|failure|failed|timeout|crash|terminated)/.test(event))
+      ||(event==="singleplayer:worker"
+        &&/(?:^|[-_])(?:error|failure|failed|crash|terminated)(?:$|[-_])/.test(type));
+  });
+}
+
+function frameDifference(beforePng,afterPng) {
+  const before=decodePng(beforePng);
+  const after=decodePng(afterPng);
+  if(before.width!==after.width||before.height!==after.height) {
+    return {available:false,widthBefore:before.width,heightBefore:before.height,
+      widthAfter:after.width,heightAfter:after.height,changedPixelRatio:0,
+      normalizedMeanAbsoluteDifference:0,error:"screenshot dimensions differ"};
+  }
+  let changed=0;
+  let absolute=0;
+  const pixels=before.width*before.height;
+  for(let offset=0;offset<before.rgba.length;offset+=4) {
+    const red=Math.abs(before.rgba[offset]-after.rgba[offset]);
+    const green=Math.abs(before.rgba[offset+1]-after.rgba[offset+1]);
+    const blue=Math.abs(before.rgba[offset+2]-after.rgba[offset+2]);
+    absolute+=red+green+blue;
+    if(Math.max(red,green,blue)>=12)changed++;
+  }
+  return {available:true,width:before.width,height:before.height,
+    changedPixelRatio:pixels?changed/pixels:0,
+    normalizedMeanAbsoluteDifference:pixels?absolute/(pixels*3*255):0,
+    beforeSha256:createHash("sha256").update(beforePng).digest("hex"),
+    afterSha256:createHash("sha256").update(afterPng).digest("hex")};
+}
+
+function frameDifferencePass(difference) {
+  return difference?.available===true
+    &&difference.beforeSha256!==difference.afterSha256
+    &&finite(difference.changedPixelRatio)>=MIN_CHANGED_PIXEL_RATIO
+    &&finite(difference.normalizedMeanAbsoluteDifference)>=MIN_NORMALIZED_PIXEL_DIFFERENCE;
+}
+
+async function readSingleplayerState(cdp) {
+  return await evaluate(cdp,`(()=>{const s=window.__gaiusMinecraftState||{};const events=Array.isArray(window.__gaiusMinecraftEvents)?window.__gaiusMinecraftEvents:[];const countFor=event=>events.filter(x=>x?.event===event).reduce((maximum,x)=>Math.max(maximum,Number(x?.count)||0),0);let workerTelemetry=null;try{workerTelemetry=JSON.parse(JSON.stringify(window.__gaiusWorkerMessageTelemetry||null));}catch(_){}return {screen:s.screen||null,level:!!s.level,levelClass:s.level||null,loadedChunkCount:Number(s.loadedChunkCount)||0,player:s.player||null,chunkEventCount:countFor('client.handleLevelChunkWithLight'),chunkBatchEventCount:countFor('client.handleChunkBatchFinished'),events,workerTelemetry};})()`);
+}
+
+async function captureTerrainFrame(cdp) {
+  const geometry=await evaluate(cdp,`(()=>{const canvas=document.querySelector('canvas');if(!canvas)return null;const r=canvas.getBoundingClientRect();if(!(r.width>0&&r.height>0))return null;const width=Math.min(320,r.width);const height=Math.min(200,r.height);const x=r.left+(r.width-width)/2;const y=r.top+(r.height-height)*0.34;return {canvas:{x:r.left,y:r.top,width:r.width,height:r.height},clip:{x,y,width,height,scale:1},mask:{width,height,reason:'fixed central world-only crop keeps baseline/final screenshots comparable and avoids HUD edges'}};})()`);
+  if(!geometry?.clip)throw new Error("Minecraft canvas is unavailable for terrain capture");
+  const captured=await cdp.send("Page.captureScreenshot",{format:"png",fromSurface:true,
+    captureBeyondViewport:true,clip:geometry.clip});
+  const png=Buffer.from(captured.data||"","base64");
+  if(!png.length)throw new Error("Chrome returned an empty terrain screenshot");
+  return {png,visual:analyzeTerrainPng(png),...geometry};
+}
+
+const movementKeys={
+  KeyW:{key:"w",code:"KeyW",virtualKeyCode:87},
+  KeyA:{key:"a",code:"KeyA",virtualKeyCode:65},
+  KeyS:{key:"s",code:"KeyS",virtualKeyCode:83},
+  KeyD:{key:"d",code:"KeyD",virtualKeyCode:68},
+  Space:{key:" ",code:"Space",virtualKeyCode:32},
+};
+
+async function dispatchKey(cdp,code,down) {
+  const key=movementKeys[code];
+  await cdp.send("Input.dispatchKeyEvent",{type:down?"keyDown":"keyUp",key:key.key,
+    code:key.code,windowsVirtualKeyCode:key.virtualKeyCode,
+    nativeVirtualKeyCode:key.virtualKeyCode,autoRepeat:false,isKeypad:false});
+}
+
+function terrainAcceptancePass(terrain) {
+  const newChunkEvidence=finite(terrain.newChunkEventCount)>=MIN_NEW_CHUNK_EVENTS
+    ||finite(terrain.newChunkBatchEventCount)>=MIN_NEW_CHUNK_EVENTS
+    ||finite(terrain.movementLoadedChunkDelta)>=MIN_MOVEMENT_LOADED_CHUNK_GROWTH;
+  return terrain?.ready===true
+    &&finite(terrain.loadedChunkCount)>=MIN_LOADED_CHUNKS
+    &&finite(terrain.maxLoadedChunkCount)>=MIN_LOADED_CHUNKS
+    &&finite(terrain.loadedChunkDelta)>=MIN_LOADED_CHUNK_GROWTH
+    &&finite(terrain.movementLoadedChunkDelta)>=MIN_MOVEMENT_LOADED_CHUNK_GROWTH
+    &&finite(terrain.chunkEventCount)>0
+    &&newChunkEvidence
+    &&(finite(terrain.movement?.chunkTravel)>=MIN_CHUNK_TRAVEL
+      ||finite(terrain.movementLoadedChunkDelta)>=MIN_LOADED_CHUNK_GROWTH)
+    &&(finite(terrain.movement?.coordinateTravel)>=MIN_CHUNK_TRAVEL*8
+      ||finite(terrain.movementLoadedChunkDelta)>=MIN_LOADED_CHUNK_GROWTH)
+    &&terrain.movement?.inputMethod==="cdp.Input.dispatchKeyEvent"
+    &&terrainVisualPass(terrain.baselineVisual)
+    &&terrainVisualPass(terrain.visual)
+    &&finite(terrain.stableVisualFrames)>=2
+    &&frameDifferencePass(terrain.frameDifference)
+    &&terrain.workerTelemetry!=null&&typeof terrain.workerTelemetry==="object"
+    &&finite(terrain.workerTelemetry.received)>0
+    &&finite(terrain.workerTelemetry.network?.integratedServerPumpFailures)===0
+    &&finite(terrain.workerTelemetry.network?.integratedServerPumpRetryExhaustions)===0
+    &&Array.isArray(terrain.failureEvents)&&terrain.failureEvents.length===0;
+}
+
 async function captureSingleplayerTerrain(cdp) {
   const screenshotPath=output.replace(/\.json$/i,"")+"-terrain.png";
-  const deadline=Date.now()+Math.min(timeoutMs,120000);
+  const baselineScreenshotPath=output.replace(/\.json$/i,"")+"-terrain-baseline.png";
+  const deadline=Date.now()+Math.min(timeoutMs,180000);
   const samples=[];
+  const initialState=await readSingleplayerState(cdp);
+  let baseline=null;
   let last=null;
+  let maxLoadedChunkCount=finite(initialState.loadedChunkCount);
+  samples.push({phase:"initial",at:new Date().toISOString(),
+    loadedChunkCount:initialState.loadedChunkCount,chunkEventCount:initialState.chunkEventCount,
+    chunkBatchEventCount:initialState.chunkBatchEventCount,
+    player:initialState.player,playerChunk:playerChunk(initialState.player),
+    workerTelemetry:initialState.workerTelemetry});
   while(Date.now()<deadline){
-    const state=await evaluate(cdp,`(()=>{const s=window.__gaiusMinecraftState||{};const events=Array.isArray(window.__gaiusMinecraftEvents)?window.__gaiusMinecraftEvents:[];const chunkEvents=events.filter(x=>x?.event==='client.handleLevelChunkWithLight');const chunkEventCount=chunkEvents.reduce((maximum,x)=>Math.max(maximum,Number(x?.count)||0),0);return {screen:s.screen||null,level:!!s.level,levelClass:s.level||null,loadedChunkCount:Number(s.loadedChunkCount)||0,player:s.player||null,chunkEventCount};})()`);
+    const state=await readSingleplayerState(cdp);
+    maxLoadedChunkCount=Math.max(maxLoadedChunkCount,finite(state.loadedChunkCount));
     if(state?.level&&state?.screen==null){
-      const captured=await cdp.send("Page.captureScreenshot",{format:"png",fromSurface:true,captureBeyondViewport:false});
-      const png=Buffer.from(captured.data||"","base64");
       try {
-        const visual=analyzeTerrainPng(png);
-        last={state,png,visual,ready:Number(state.loadedChunkCount)>0&&Number(state.chunkEventCount)>0&&terrainVisualPass(visual)};
-        samples.push({at:new Date().toISOString(),loadedChunkCount:state.loadedChunkCount,chunkEventCount:state.chunkEventCount,visual:{terrainVisualPass:visual.terrainVisualPass,lowerLuminanceStdDev:visual.lowerLuminanceStdDev,lowerColorBuckets:visual.lowerColorBuckets,lowerEdgeDensity:visual.lowerEdgeDensity,lowerTexturedTileCount:visual.lowerTexturedTileCount}});
-        if(last.ready)break;
+        const frame=await captureTerrainFrame(cdp);
+        last={state,...frame};
+        samples.push({phase:"baseline-wait",at:new Date().toISOString(),
+          loadedChunkCount:state.loadedChunkCount,chunkEventCount:state.chunkEventCount,
+          chunkBatchEventCount:state.chunkBatchEventCount,
+          player:state.player,workerTelemetry:state.workerTelemetry,
+          visual:{terrainVisualPass:frame.visual.terrainVisualPass,
+            lowerLuminanceStdDev:frame.visual.lowerLuminanceStdDev,
+            lowerColorBuckets:frame.visual.lowerColorBuckets,
+            lowerEdgeDensity:frame.visual.lowerEdgeDensity,
+            lowerTexturedTileCount:frame.visual.lowerTexturedTileCount}});
+        if(finite(state.loadedChunkCount)>=MIN_LOADED_CHUNKS
+            &&finite(state.chunkEventCount)>0&&terrainVisualPass(frame.visual)
+            &&failureEvents(state.events).length===0){baseline=last;break;}
       } catch(error) {
-        last={state,png,visual:null,ready:false,visualError:String(error?.stack||error)};
+        last={state,png:last?.png||null,visual:null,visualError:String(error?.stack||error)};
       }
     }
     await sleep(1500);
   }
-  if(!last?.png?.length)return {ready:false,screenshotPath,samples,error:"no in-world screenshot was captured"};
+  if(!baseline?.png?.length) {
+    if(last?.png?.length){await mkdir(dirname(screenshotPath),{recursive:true});await writeFile(screenshotPath,last.png);}
+    return {ready:false,screenshotPath,baselineScreenshotPath,samples,
+      loadedChunkCount:last?.state?.loadedChunkCount||0,maxLoadedChunkCount,
+      chunkEventCount:last?.state?.chunkEventCount||0,
+      workerTelemetry:last?.state?.workerTelemetry||initialState.workerTelemetry||null,
+      failureEvents:failureEvents(last?.state?.events||initialState.events),
+      visual:last?.visual||null,visualError:last?.visualError||null,
+      error:"baseline terrain never reached strict multi-chunk visual readiness"};
+  }
+
+  const baselineLoaded=finite(baseline.state.loadedChunkCount);
+  const baselineChunkEvents=finite(baseline.state.chunkEventCount);
+  const baselineChunkBatchEvents=finite(baseline.state.chunkBatchEventCount);
+  const startPlayer=baseline.state.player;
+  const startChunk=playerChunk(startPlayer);
+  let keyEvents=0;
+  await clickAt(cdp,baseline.canvas.x+baseline.canvas.width/2,
+    baseline.canvas.y+baseline.canvas.height/2);
+  // Keep the movement entirely on the CDP input path, but do not assume that
+  // the spawn point has an unobstructed cardinal direction.  A single held
+  // key can leave the player pressed against a tree, cliff, or water edge;
+  // rotate through cardinal/diagonal plans and retain the first path that
+  // actually crosses chunks.  This is still real in-game movement, not a
+  // state injection.
+  const directions=[["KeyW"],["KeyA"],["KeyD"],["KeyS"],
+    ["KeyW","KeyA"],["KeyW","KeyD"],["KeyS","KeyA"],["KeyS","KeyD"]];
+  let bestMovementDistance=0;
+  let bestMovementState=startPlayer;
+  for(const plan of directions) {
+    if(Date.now()>=deadline)break;
+    for(const direction of plan) { await dispatchKey(cdp,direction,true); keyEvents++; }
+    try {
+      for(let step=0;step<16&&Date.now()<deadline;step++) {
+        await sleep(900);
+        const state=await readSingleplayerState(cdp);
+        maxLoadedChunkCount=Math.max(maxLoadedChunkCount,finite(state.loadedChunkCount));
+        const currentChunk=playerChunk(state.player);
+        const distance=playerTravel(startPlayer,state.player);
+        if(distance>bestMovementDistance) {
+          bestMovementDistance=distance;
+          bestMovementState=state.player;
+        }
+        samples.push({phase:"movement",at:new Date().toISOString(),direction:plan,
+          loadedChunkCount:state.loadedChunkCount,chunkEventCount:state.chunkEventCount,
+          chunkBatchEventCount:state.chunkBatchEventCount,
+          player:state.player,playerChunk:currentChunk,coordinateTravel:distance,
+          workerTelemetry:state.workerTelemetry});
+        if(chunkTravel(startChunk,currentChunk)>=MIN_CHUNK_TRAVEL
+            &&(finite(state.chunkEventCount)-baselineChunkEvents>=MIN_NEW_CHUNK_EVENTS
+              ||finite(state.chunkBatchEventCount)-baselineChunkBatchEvents>=MIN_NEW_CHUNK_EVENTS
+              ||maxLoadedChunkCount-baselineLoaded>=MIN_MOVEMENT_LOADED_CHUNK_GROWTH)
+            &&maxLoadedChunkCount-baselineLoaded>=MIN_MOVEMENT_LOADED_CHUNK_GROWTH)break;
+      }
+    } finally {for(const direction of [...plan].reverse()) {await dispatchKey(cdp,direction,false);keyEvents++;}}
+    const state=await readSingleplayerState(cdp);
+    if(chunkTravel(startChunk,playerChunk(state.player))>=MIN_CHUNK_TRAVEL
+        &&(finite(state.chunkEventCount)-baselineChunkEvents>=MIN_NEW_CHUNK_EVENTS
+          ||finite(state.chunkBatchEventCount)-baselineChunkBatchEvents>=MIN_NEW_CHUNK_EVENTS
+          ||maxLoadedChunkCount-baselineLoaded>=MIN_MOVEMENT_LOADED_CHUNK_GROWTH)
+        &&maxLoadedChunkCount-baselineLoaded>=MIN_MOVEMENT_LOADED_CHUNK_GROWTH)break;
+  }
+
+  let stableVisualFrames=0;
+  let finalFrame=null;
+  while(Date.now()<deadline&&stableVisualFrames<2) {
+    const state=await readSingleplayerState(cdp);
+    maxLoadedChunkCount=Math.max(maxLoadedChunkCount,finite(state.loadedChunkCount));
+    const frame=await captureTerrainFrame(cdp);
+    last={state,...frame};
+    const currentChunk=playerChunk(state.player);
+    const observedChunkTravel=Math.max(chunkTravel(startChunk,currentChunk),
+      chunkTravel(startChunk,playerChunk(bestMovementState)));
+    const candidate=state.screen==null&&terrainVisualPass(frame.visual)
+      &&(observedChunkTravel>=MIN_CHUNK_TRAVEL
+        ||maxLoadedChunkCount-baselineLoaded>=MIN_LOADED_CHUNK_GROWTH)
+      &&(finite(state.chunkEventCount)-baselineChunkEvents>=MIN_NEW_CHUNK_EVENTS
+        ||finite(state.chunkBatchEventCount)-baselineChunkBatchEvents>=MIN_NEW_CHUNK_EVENTS
+        ||maxLoadedChunkCount-baselineLoaded>=MIN_MOVEMENT_LOADED_CHUNK_GROWTH)
+      &&maxLoadedChunkCount>=MIN_LOADED_CHUNKS
+      &&maxLoadedChunkCount-finite(initialState.loadedChunkCount)>=MIN_LOADED_CHUNK_GROWTH
+      &&maxLoadedChunkCount-baselineLoaded>=MIN_MOVEMENT_LOADED_CHUNK_GROWTH
+      &&failureEvents(state.events).length===0;
+    stableVisualFrames=candidate?stableVisualFrames+1:0;
+    samples.push({phase:"final-wait",at:new Date().toISOString(),
+      screen:state.screen,
+      loadedChunkCount:state.loadedChunkCount,chunkEventCount:state.chunkEventCount,
+      chunkBatchEventCount:state.chunkBatchEventCount,
+      player:state.player,playerChunk:currentChunk,workerTelemetry:state.workerTelemetry,
+      stableVisualFrames,visual:{terrainVisualPass:frame.visual.terrainVisualPass,
+        lowerLuminanceStdDev:frame.visual.lowerLuminanceStdDev,
+        lowerColorBuckets:frame.visual.lowerColorBuckets,
+        lowerEdgeDensity:frame.visual.lowerEdgeDensity,
+        lowerTexturedTileCount:frame.visual.lowerTexturedTileCount}});
+    if(candidate)finalFrame=last;
+    if(stableVisualFrames<2)await sleep(750);
+  }
+
+  last=finalFrame||last;
+  const finalState=last.state;
+  const endPlayer=finalState.player;
+  // The player may naturally drift back toward spawn after the probe keys are
+  // released.  Report the farthest sampled position as the movement endpoint
+  // so the gate validates the trajectory that actually occurred, while the
+  // final screenshot remains the independently captured render frame.
+  const movementEndPlayer=bestMovementDistance>playerTravel(startPlayer,endPlayer)
+    ?bestMovementState:endPlayer;
+  const endChunk=playerChunk(movementEndPlayer);
+  const difference=frameDifference(baseline.png,last.png);
+  const failures=failureEvents(finalState.events);
+  const movement={inputMethod:"cdp.Input.dispatchKeyEvent",keyEvents,start:startPlayer,
+    end:movementEndPlayer,startChunk,endChunk,chunkTravel:chunkTravel(startChunk,endChunk),
+    coordinateTravel:playerTravel(startPlayer,movementEndPlayer),
+    farthestCoordinateTravel:bestMovementDistance,
+    farthestPlayer:bestMovementState};
   await mkdir(dirname(screenshotPath),{recursive:true});
-  await writeFile(screenshotPath,last.png);
+  await Promise.all([writeFile(baselineScreenshotPath,baseline.png),writeFile(screenshotPath,last.png)]);
   const identity={bytes:last.png.length,sha256:createHash("sha256").update(last.png).digest("hex")};
-  return {ready:last.ready===true,screenshotPath,identity,loadedChunkCount:last.state?.loadedChunkCount||0,chunkEventCount:last.state?.chunkEventCount||0,player:last.state?.player||null,visual:last.visual,samples,visualError:last.visualError||null};
+  const baselineIdentity={bytes:baseline.png.length,
+    sha256:createHash("sha256").update(baseline.png).digest("hex")};
+  const terrain={ready:false,screenshotPath,identity,baselineScreenshotPath,baselineIdentity,
+    capture:{canvas:baseline.canvas,clip:baseline.clip,mask:baseline.mask},
+    initialLoadedChunkCount:finite(initialState.loadedChunkCount),
+    baselineLoadedChunkCount:baselineLoaded,
+    loadedChunkCount:finite(finalState.loadedChunkCount),maxLoadedChunkCount,
+    loadedChunkDelta:maxLoadedChunkCount-finite(initialState.loadedChunkCount),
+    movementLoadedChunkDelta:maxLoadedChunkCount-baselineLoaded,
+    initialChunkEventCount:finite(initialState.chunkEventCount),
+    baselineChunkEventCount:baselineChunkEvents,
+    chunkEventCount:finite(finalState.chunkEventCount),
+    newChunkEventCount:finite(finalState.chunkEventCount)-baselineChunkEvents,
+    initialChunkBatchEventCount:finite(initialState.chunkBatchEventCount),
+    baselineChunkBatchEventCount:baselineChunkBatchEvents,
+    chunkBatchEventCount:finite(finalState.chunkBatchEventCount),
+    newChunkBatchEventCount:finite(finalState.chunkBatchEventCount)-baselineChunkBatchEvents,
+    player:endPlayer,movement,baselineVisual:baseline.visual,visual:last.visual,
+    frameDifference:difference,stableVisualFrames,workerTelemetry:finalState.workerTelemetry,
+    failureEvents:failures,samples,visualError:last.visualError||null};
+  terrain.ready=terrainAcceptancePass({...terrain,ready:true});
+  return terrain;
 }
 
 async function closeCdp(cdp, timeoutMilliseconds=2000) {
@@ -289,10 +581,7 @@ function singleRuntimeGate(runMode,singleRuntime) {
     &&singleRuntime?.wasm?.disabled!==true
     &&singleRuntime?.storage==="ok"
     &&singleRuntime?.idb==="ok"
-    &&singleRuntime?.terrain?.ready===true
-    &&Number(singleRuntime?.terrain?.loadedChunkCount)>0
-    &&Number(singleRuntime?.terrain?.chunkEventCount)>0
-    &&terrainVisualPass(singleRuntime?.terrain?.visual);
+    &&terrainAcceptancePass(singleRuntime?.terrain);
 }
 
 function finalAcceptanceGate({runMode,singleRuntime,baseReady,cleanup,artifactIdentity}) {
@@ -346,14 +635,31 @@ if(process.argv.includes("--static-self-test")){
     "every CDP command must have a finite timeout");
   assert.equal(timeoutCdp.pending.size,0);
   const terrain={available:true,nonBlackRatio:.5,luminanceStdDev:30,colorBuckets:100,centralLuminanceStdDev:20,centralColorBuckets:80,centralDominantColorRatio:.2,activeTileCount:12,lowerLuminanceStdDev:20,lowerColorBuckets:60,lowerEdgeDensity:.1,lowerTexturedTileCount:10,lowerTexturedRowCount:3,lowerTexturedColumnCount:4};
-  const ready={level:true,wasm:{ready:true,disabled:false},storage:"ok",idb:"ok",terrain:{ready:true,loadedChunkCount:4,chunkEventCount:2,visual:terrain}};
+  const readyTerrain={ready:true,initialLoadedChunkCount:1,baselineLoadedChunkCount:3,
+    loadedChunkCount:7,maxLoadedChunkCount:7,loadedChunkDelta:6,movementLoadedChunkDelta:4,
+    initialChunkEventCount:1,baselineChunkEventCount:3,chunkEventCount:7,newChunkEventCount:4,
+    movement:{inputMethod:"cdp.Input.dispatchKeyEvent",keyEvents:12,chunkTravel:3,
+      coordinateTravel:49,start:{x:0,z:0},end:{x:49,z:0}},baselineVisual:terrain,visual:terrain,
+    stableVisualFrames:2,frameDifference:{available:true,beforeSha256:"a",afterSha256:"b",
+      changedPixelRatio:.5,normalizedMeanAbsoluteDifference:.2},workerTelemetry:{received:2},
+    failureEvents:[]};
+  const ready={level:true,wasm:{ready:true,disabled:false},storage:"ok",idb:"ok",terrain:readyTerrain};
   assert.equal(singleRuntimeGate("single",ready),true);
   assert.equal(singleRuntimeGate("single",{...ready,level:false}),false);
   assert.equal(singleRuntimeGate("single",{...ready,wasm:{ready:true,disabled:true}}),false);
   assert.equal(singleRuntimeGate("single",{...ready,storage:"failed"}),false);
   assert.equal(singleRuntimeGate("single",{...ready,idb:"unavailable"}),false);
-  assert.equal(singleRuntimeGate("single",{...ready,terrain:{...ready.terrain,loadedChunkCount:0}}),false);
-  assert.equal(singleRuntimeGate("single",{...ready,terrain:{...ready.terrain,chunkEventCount:0}}),false);
+  assert.equal(singleRuntimeGate("single",{...ready,terrain:{...ready.terrain,loadedChunkCount:1}}),false);
+  assert.equal(singleRuntimeGate("single",{...ready,terrain:{...ready.terrain,newChunkEventCount:0,newChunkBatchEventCount:0,movementLoadedChunkDelta:0}}),false);
+  assert.equal(singleRuntimeGate("single",{...ready,terrain:{...ready.terrain,
+    movementLoadedChunkDelta:0,movement:{...ready.terrain.movement,chunkTravel:1}}}),false);
+  assert.equal(singleRuntimeGate("single",{...ready,terrain:{...ready.terrain,
+    frameDifference:{...ready.terrain.frameDifference,changedPixelRatio:0}}}),false);
+  assert.equal(singleRuntimeGate("single",{...ready,terrain:{...ready.terrain,
+    workerTelemetry:{received:2,network:{integratedServerPumpFailures:1,
+      integratedServerPumpRetryExhaustions:0}}}}),false);
+  assert.equal(singleRuntimeGate("single",{...ready,terrain:{...ready.terrain,
+    workerTelemetry:null}}),false);
   assert.equal(singleRuntimeGate("single",{...ready,terrain:{...ready.terrain,visual:{...terrain,lowerEdgeDensity:0}}}),false);
   assert.equal(singleRuntimeGate("both",ready),true);
   assert.equal(singleRuntimeGate("both",null),false);
@@ -437,10 +743,12 @@ try {
     await clickWidget(cdp,"Singleplayer"); await waitFor(cdp,"/SelectWorldScreen|CreateWorldScreen/.test(String(window.__gaiusMinecraftState?.screen||''))",60000,"singleplayer world-selection screen");
     let screen=await evaluate(cdp,"String(window.__gaiusMinecraftState?.screen||'')");
     if(screen.includes("SelectWorldScreen")) { const create=await findWidget(cdp,"Create New World",5000); if(create) { await clickAt(cdp,create.x,create.y); await waitFor(cdp,"String(window.__gaiusMinecraftState?.screen||'').includes('CreateWorldScreen')",60000,"create-world screen"); } else throw new Error("existing worlds were listed but Create New World was not visible"); }
+    await preferCreativeWorld(cdp);
     await clickWidget(cdp,"Create New World"); await waitFor(cdp,"!!window.__gaiusMinecraftState?.level&&!window.__gaiusMinecraftState?.screen",timeoutMs,"active singleplayer world");
     const terrain=await captureSingleplayerTerrain(cdp);
-    singleRuntime = await evaluate(cdp,`(async()=>{let idb='unavailable',storage='unavailable',opfs='unavailable';try{localStorage.setItem('gaius.file.acceptance','1');storage=localStorage.getItem('gaius.file.acceptance')==='1'?'ok':'failed';}catch(e){storage=String(e)}try{if(indexedDB){const r=indexedDB.open('gaius-file-acceptance',1);await new Promise((ok,bad)=>{r.onsuccess=()=>{r.result.close();ok()};r.onerror=()=>bad(r.error||new Error('idb'))});idb='ok';}}catch(e){idb=String(e)}try{opfs=!!navigator.storage?.getDirectory?'ok':'unsupported';}catch(e){opfs=String(e)}return {capturedAt:new Date().toISOString(),stage:'singleplayer-world',protocol:location.protocol,href:location.href,screen:window.__gaiusMinecraftState?.screen||null,level:!!window.__gaiusMinecraftState?.level,portableBuild:!!window.__gaiusPortableBuild,classesUrl:String(window.__gaiusClassesUrl||''),workerUrl:String(window.__gaiusSingleplayerWorkerUrl||''),wasmUrl:String(window.__gaiusHotpathWasmUrl||''),wasm:window.__gaiusWasmHotpath?{ready:!!window.__gaiusWasmHotpath.ready,disabled:!!window.__gaiusWasmHotpath.disabled,error:window.__gaiusWasmHotpath.error||null}:null,storage,idb,opfs,workers:window.__gaiusSingleplayerWorkers?window.__gaiusSingleplayerWorkers.size:null,canvas:document.querySelector('canvas')?.getBoundingClientRect().toJSON()||null,resources:performance.getEntriesByType('resource').map(x=>({name:x.name,duration:x.duration,transferSize:x.transferSize,decodedBodySize:x.decodedBodySize})),events:window.__gaiusMinecraftEvents||[],bridgeTrace:window.__gaiusBridgeTrace||[]};})()`);
+    singleRuntime = await evaluate(cdp,`(async()=>{let idb='unavailable',storage='unavailable',opfs='unavailable';try{localStorage.setItem('gaius.file.acceptance','1');storage=localStorage.getItem('gaius.file.acceptance')==='1'?'ok':'failed';}catch(e){storage=String(e)}try{if(indexedDB){const r=indexedDB.open('gaius-file-acceptance',1);await new Promise((ok,bad)=>{r.onsuccess=()=>{r.result.close();ok()};r.onerror=()=>bad(r.error||new Error('idb'))});idb='ok';}}catch(e){idb=String(e)}try{opfs=!!navigator.storage?.getDirectory?'ok':'unsupported';}catch(e){opfs=String(e)}let workerTelemetry=null;try{workerTelemetry=JSON.parse(JSON.stringify(window.__gaiusWorkerMessageTelemetry||null));}catch(e){workerTelemetry={captureError:String(e)}}return {capturedAt:new Date().toISOString(),stage:'singleplayer-world',protocol:location.protocol,href:location.href,screen:window.__gaiusMinecraftState?.screen||null,level:!!window.__gaiusMinecraftState?.level,portableBuild:!!window.__gaiusPortableBuild,classesUrl:String(window.__gaiusClassesUrl||''),workerUrl:String(window.__gaiusSingleplayerWorkerUrl||''),wasmUrl:String(window.__gaiusHotpathWasmUrl||''),wasm:window.__gaiusWasmHotpath?{ready:!!window.__gaiusWasmHotpath.ready,disabled:!!window.__gaiusWasmHotpath.disabled,error:window.__gaiusWasmHotpath.error||null}:null,storage,idb,opfs,workers:window.__gaiusSingleplayerWorkers?window.__gaiusSingleplayerWorkers.size:null,workerTelemetry,canvas:document.querySelector('canvas')?.getBoundingClientRect().toJSON()||null,resources:performance.getEntriesByType('resource').map(x=>({name:x.name,duration:x.duration,transferSize:x.transferSize,decodedBodySize:x.decodedBodySize})),events:window.__gaiusMinecraftEvents||[],bridgeTrace:window.__gaiusBridgeTrace||[]};})()`);
     singleRuntime.terrain=terrain;
+    singleRuntime.workerTelemetry=terrain.workerTelemetry||singleRuntime.workerTelemetry;
   }
   if(mode === "multi" || mode === "both") {
     if(mode === "both") { await evaluate(cdp,"location.reload()") ; await waitFor(cdp,"document.querySelector('#profile-gate')?.hidden===false",60000,"second profile gate"); await evaluate(cdp,`(()=>{const i=document.querySelector('#profile-name');i.value=${JSON.stringify(playerName+"M")};i.dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('#profile-submit').click();return true;})()`); await waitFor(cdp,"String(window.__gaiusMinecraftState?.screen||'').endsWith('TitleScreen')",timeoutMs,"title after reload"); }

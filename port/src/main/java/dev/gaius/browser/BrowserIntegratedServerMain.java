@@ -329,14 +329,17 @@ public final class BrowserIntegratedServerMain {
 
     /**
      * Called by the patched BlockableEventLoop.doRunTask immediately before dispatching a queued
-     * runnable. Object identity, not TeaVM's Thread wrapper identity, proves that this is our
-     * private TickTask. The caller must pair this with endScheduledNetworkInputTask in finally.
+     * runnable. TeaVM may restore a queued TickTask as a fresh Java wrapper, so object identity
+     * against the static task reference is not stable across a resumed Worker continuation. The
+     * network wakeup uses the reserved minimum tick priority; that marker survives wrapper
+     * restoration and remains distinct from every vanilla scheduled task. The caller must pair
+     * this with endScheduledNetworkInputTask in finally.
      */
     public static boolean beginScheduledNetworkInputTask(Runnable task) {
         MinecraftServer current = server;
         if (!isWorkerRuntime() || current == null || serverThreadExited || !current.isRunning()
-                || !NETWORK_INPUT_TASK_SCHEDULED.get() || task == null
-                || task != scheduledNetworkInputTask || activeNetworkInputTask != null) {
+                || !NETWORK_INPUT_TASK_SCHEDULED.get() || !(task instanceof TickTask tickTask)
+                || tickTask.getTick() != Integer.MIN_VALUE || activeNetworkInputTask != null) {
             return false;
         }
         activeNetworkInputTask = task;

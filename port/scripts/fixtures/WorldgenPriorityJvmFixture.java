@@ -3,6 +3,7 @@ import java.util.Queue;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.util.thread.PriorityConsecutiveExecutor;
+import org.teavm.platform.Platform;
 
 public final class WorldgenPriorityJvmFixture {
     private static final class Gate implements Executor {
@@ -30,6 +31,10 @@ public final class WorldgenPriorityJvmFixture {
                 draining = false;
             }
         }
+
+        int pendingCount() {
+            return pending.size();
+        }
     }
 
     public static void main(String[] args) {
@@ -37,7 +42,8 @@ public final class WorldgenPriorityJvmFixture {
         PriorityConsecutiveExecutor dispatcher =
                 new PriorityConsecutiveExecutor(4, gate, "worldgen-dispatcher");
         AtomicInteger count = new AtomicInteger();
-        for (int i = 0; i < 50_000; i++) {
+        final int taskCount = 4_096;
+        for (int i = 0; i < taskCount; i++) {
             int expected = i;
             dispatcher.schedule(dispatcher.wrapRunnable(() -> {
                 int actual = count.getAndIncrement();
@@ -47,25 +53,47 @@ public final class WorldgenPriorityJvmFixture {
             }));
         }
         gate.drainOne();
-        if (count.get() != 50_000 || dispatcher.hasWork()) {
-            throw new AssertionError("worldgen backlog did not drain");
+        if (count.get() != 1 || !dispatcher.hasWork() || gate.pendingCount() != 0
+                || Platform.pendingThreads() != 1) {
+            throw new AssertionError("first worldgen turn was not bounded to one task");
+        }
+        while (count.get() < taskCount) {
+            int before = count.get();
+            Platform.runNextThread();
+            if (count.get() != before || gate.pendingCount() != 1) {
+                throw new AssertionError("deferred callback bypassed the executor boundary");
+            }
+            gate.drainOne();
+            if (count.get() != before + 1) {
+                throw new AssertionError("worldgen turn did not execute exactly one task");
+            }
+        }
+        if (dispatcher.hasWork() || gate.pendingCount() != 0 || Platform.pendingThreads() != 0) {
+            throw new AssertionError("worldgen backlog did not drain cleanly");
+        }
+        if (Platform.startedThreads() != taskCount - 1) {
+            throw new AssertionError("worldgen backlog did not use one deferred turn per continuation");
         }
 
         Gate errorGate = new Gate();
         PriorityConsecutiveExecutor errorDispatcher =
                 new PriorityConsecutiveExecutor(4, errorGate, "worldgen-dispatcher");
+        AtomicInteger recoveredCount = new AtomicInteger();
         errorDispatcher.schedule(errorDispatcher.wrapRunnable(() -> { throw new ExpectedFailure(); }));
+        errorDispatcher.schedule(errorDispatcher.wrapRunnable(recoveredCount::incrementAndGet));
         try {
             errorGate.drainOne();
             throw new AssertionError("expected task failure");
         } catch (ExpectedFailure expected) {
             // The patched finally path must leave the executor schedulable.
         }
-        if (errorDispatcher.hasWork()) {
-            throw new AssertionError("exception path left stale work");
+        if (!errorDispatcher.hasWork()) {
+            throw new AssertionError("exception path lost queued recovery work");
         }
-        AtomicInteger recoveredCount = new AtomicInteger();
-        errorDispatcher.schedule(errorDispatcher.wrapRunnable(recoveredCount::incrementAndGet));
+        if (errorGate.pendingCount() != 0 || Platform.pendingThreads() != 1) {
+            throw new AssertionError("exception recovery did not retain its deferred turn");
+        }
+        Platform.runNextThread();
         errorGate.drainOne();
         if (recoveredCount.get() != 1) {
             throw new AssertionError("exception path did not recover");
@@ -94,9 +122,6 @@ public final class WorldgenPriorityJvmFixture {
         nullName.schedule(nullName.wrapRunnable(nullNameCount::incrementAndGet));
         if (nullNameCount.get() != 1 || nullName.hasWork()) {
             throw new AssertionError("null-name dispatcher behavior changed");
-        }
-        if (org.teavm.classlib.java.lang.TModernRuntimeSupport.calls == 0) {
-            throw new AssertionError("worldgen loop never reached the yield hook");
         }
         System.out.println("WORLDGEN_PRIORITY_JVM_OK count=" + count.get());
     }
