@@ -13570,7 +13570,6 @@ public final class MinecraftClientPatcher {
             throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/multiplayer/ClientPacketListener.class");
         boolean handleLoginHooked = false;
-        boolean handleLoginImmediateReadyHooked = false;
         boolean startWaitingHooked = false;
         boolean levelChunkHooked = false;
         boolean batchStartHooked = false;
@@ -13579,7 +13578,6 @@ public final class MinecraftClientPatcher {
         boolean tickClientLoadHooked = false;
         boolean loadingPacketsHooked = false;
         boolean notifyPlayerLoadedHooked = false;
-        boolean levelReadyFallbackHooked = false;
         boolean closeLoadingScreenHooked = false;
 
         for (MethodNode method : node.methods) {
@@ -13588,28 +13586,6 @@ public final class MinecraftClientPatcher {
                 method.instructions.insert(minecraftEvent("client.handleLogin"));
                 method.maxStack = Math.max(method.maxStack, 1);
                 handleLoginHooked = true;
-                int returnHooks = 0;
-                for (AbstractInsnNode instruction : method.instructions.toArray()) {
-                    if (instruction.getOpcode() != Opcodes.RETURN) {
-                        continue;
-                    }
-                    InsnList ready = new InsnList();
-                    ready.add(new VarInsnNode(Opcodes.ALOAD, 0));
-                    ready.add(new MethodInsnNode(
-                            Opcodes.INVOKEVIRTUAL,
-                            "net/minecraft/client/multiplayer/ClientPacketListener",
-                            "notifyPlayerLoaded",
-                            "()V",
-                            false));
-                    method.instructions.insertBefore(instruction, ready);
-                    returnHooks++;
-                }
-                if (returnHooks != 1) {
-                    throw new IllegalStateException(
-                            "ClientPacketListener immediate player-ready return changed: "
-                                    + returnHooks);
-                }
-                handleLoginImmediateReadyHooked = true;
             } else if (method.name.equals("startWaitingForNewLevel")
                     && method.desc.equals("(Lnet/minecraft/client/player/LocalPlayer;"
                             + "Lnet/minecraft/client/multiplayer/ClientLevel;"
@@ -13664,22 +13640,9 @@ public final class MinecraftClientPatcher {
                     if (!(next instanceof JumpInsnNode jump) || jump.getOpcode() != Opcodes.IFEQ) {
                         throw new IllegalStateException("ClientPacketListener level-ready branch shape changed");
                     }
-                    LabelNode ready = new LabelNode();
-                    InsnList code = new InsnList();
-                    code.add(new JumpInsnNode(Opcodes.IFNE, ready));
-                    code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-                    code.add(new FieldInsnNode(
-                            Opcodes.GETFIELD,
-                            "net/minecraft/client/multiplayer/ClientPacketListener",
-                            "level",
-                            "Lnet/minecraft/client/multiplayer/ClientLevel;"));
-                    code.add(new JumpInsnNode(Opcodes.IFNULL, jump.label));
-                    code.add(minecraftEvent("client.levelReady.playerPresentFallback"));
-                    code.add(ready);
-                    method.instructions.insert(call, code);
-                    method.instructions.remove(jump);
-                    method.maxStack = Math.max(method.maxStack, 2);
-                    levelReadyFallbackHooked = true;
+                    // Keep the vanilla readiness branch. A ClientLevel instance is not
+                    // sufficient evidence that terrain meshes and collision sections are
+                    // installed; advancing here makes the browser client spawn into air.
                 } else if (instruction instanceof MethodInsnNode call
                         && call.owner.equals("net/minecraft/client/multiplayer/ClientPacketListener")
                         && call.name.equals("notifyPlayerLoaded")
@@ -13699,7 +13662,6 @@ public final class MinecraftClientPatcher {
         }
 
         if (!handleLoginHooked
-                || !handleLoginImmediateReadyHooked
                 || !startWaitingHooked
                 || !levelChunkHooked
                 || !batchStartHooked
@@ -13708,7 +13670,6 @@ public final class MinecraftClientPatcher {
                 || !tickClientLoadHooked
                 || !loadingPacketsHooked
                 || !notifyPlayerLoadedHooked
-                || !levelReadyFallbackHooked
                 || !closeLoadingScreenHooked) {
             throw new IllegalStateException("ClientPacketListener loading diagnostic patch points were not found");
         }
@@ -13716,6 +13677,21 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchLevelLoadTrackerBrowserTimeout(String jar, Path root) throws IOException {
+        // The previous browser fast-path forced the client into PLAY before the
+        // initial chunk section meshes existed. Keep the vanilla state machine
+        // until terrain readiness is independently proven; diagnostics remain in
+        // ClientPacketListener above.
+        if (!Boolean.getBoolean("gaius.enableUnsafeLevelLoadFastPath")) {
+            for (String entry : new String[] {
+                    "net/minecraft/client/multiplayer/LevelLoadTracker.class",
+                    "net/minecraft/client/multiplayer/LevelLoadTracker$WaitingForServer.class",
+                    "net/minecraft/client/multiplayer/LevelLoadTracker$WaitingForPlayerChunk.class" }) {
+                Path output = root.resolve(entry);
+                Files.createDirectories(output.getParent());
+                Files.write(output, readEntry(jar, entry));
+            }
+            return;
+        }
         ClassNode tracker = read(jar, "net/minecraft/client/multiplayer/LevelLoadTracker.class");
         boolean patchedClientWaitTimeout = false;
         for (MethodNode method : tracker.methods) {
@@ -20516,15 +20492,22 @@ public final class MinecraftClientPatcher {
     }
 
     private static ClassNode read(String jarPath, String entryName) throws IOException {
-        byte[] bytes;
-        try (ZipFile jar = new ZipFile(jarPath)) {
-            try (var stream = jar.getInputStream(jar.getEntry(entryName))) {
-                bytes = stream.readAllBytes();
-            }
-        }
+        byte[] bytes = readEntry(jarPath, entryName);
         ClassNode node = new ClassNode();
         new ClassReader(bytes).accept(node, 0);
         return node;
+    }
+
+    private static byte[] readEntry(String jarPath, String entryName) throws IOException {
+        try (ZipFile jar = new ZipFile(jarPath)) {
+            var entry = jar.getEntry(entryName);
+            if (entry == null) {
+                throw new IOException("Missing class entry " + entryName + " in " + jarPath);
+            }
+            try (var stream = jar.getInputStream(entry)) {
+                return stream.readAllBytes();
+            }
+        }
     }
 
     private static ClassNode read(Path path) throws IOException {
