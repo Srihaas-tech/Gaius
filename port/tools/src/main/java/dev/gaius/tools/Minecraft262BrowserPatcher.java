@@ -69,6 +69,7 @@ public final class Minecraft262BrowserPatcher {
         patchGlDeviceCapabilities(jar, root);
         patchFramerateLimiter(jar, root);
         patchGraphicsPresetBrowserDistances(jar, root);
+        patchAtlasManagerBrowserMipmapCap(jar, root);
         patchChunkGenerationCooperation(jar, root);
         patchDistanceManagerCooperation(jar, root);
         patchServerChunkBroadcastCooperation(jar, root);
@@ -92,6 +93,112 @@ public final class Minecraft262BrowserPatcher {
         patchIdentifierResolveAgainst(jar, root);
         patchCopyOnWriteFileSystem(jar, root);
         patchCopyOnWriteProvider(jar, root);
+        patchDownloadQueueBrowserCooperativeExecutor(jar, root);
+    }
+
+    /** Caps browser atlas mip generation to avoid a 33% native-memory spike on large packs. */
+    private static void patchAtlasManagerBrowserMipmapCap(String jar, Path root)
+            throws IOException {
+        String owner = "net/minecraft/client/resources/model/sprite/AtlasManager";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode constructor = find(
+                node,
+                "<init>",
+                "(Lnet/minecraft/client/renderer/texture/TextureManager;I)V");
+        int constructorStores = 0;
+        for (AbstractInsnNode instruction : constructor.instructions.toArray()) {
+            if (!(instruction instanceof FieldInsnNode field)
+                    || field.getOpcode() != Opcodes.PUTFIELD
+                    || !field.owner.equals(owner)
+                    || !field.name.equals("maxMipmapLevels")
+                    || !field.desc.equals("I")) {
+                continue;
+            }
+            AbstractInsnNode value = previousOpcode(field);
+            if (!(value instanceof VarInsnNode load)
+                    || load.getOpcode() != Opcodes.ILOAD
+                    || load.var != 2) {
+                throw new IllegalStateException(
+                        owner + " constructor mipmap assignment shape changed");
+            }
+            constructor.instructions.set(value, new InsnNode(Opcodes.ICONST_0));
+            constructorStores++;
+        }
+        requireOne(owner + " constructor browser mipmap cap", constructorStores);
+
+        MethodNode update = find(node, "updateMaxMipLevel", "(I)V");
+        InsnList updateCode = new InsnList();
+        updateCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        updateCode.add(new InsnNode(Opcodes.ICONST_0));
+        updateCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "maxMipmapLevels", "I"));
+        updateCode.add(new InsnNode(Opcodes.RETURN));
+        replace(update, updateCode, 2, update.maxLocals);
+        writeComputeFrames(node, root.resolve(owner + ".class"));
+        System.out.println("Capped 26.2 browser atlas mipmaps at level zero");
+    }
+
+    /**
+     * Keep resource-pack downloads on a browser-yielding executor.  In 26.2
+     * DownloadQueue owns a ConsecutiveExecutor backed by Util.nonCriticalIoPool().
+     * TeaVM's browser implementation executes that pool inline; a 60&nbsp;MiB
+     * resource-pack therefore monopolises the Worker and the completion stage
+     * never reaches DownloadedPackSource.  Wrapping the pool with the same
+     * bounded cooperative adapter used by the integrated server preserves the
+     * CompletableFuture chain while yielding between download tasks.
+     */
+    private static void patchDownloadQueueBrowserCooperativeExecutor(String jar, Path root)
+            throws IOException {
+        String owner = "net/minecraft/server/packs/DownloadQueue";
+        Path output = root.resolve(owner + ".class");
+        ClassNode node;
+        if (Files.exists(output)) {
+            node = new ClassNode();
+            new ClassReader(Files.readAllBytes(output)).accept(node, 0);
+        } else {
+            node = read(jar, owner + ".class");
+        }
+
+        int patched = 0;
+        for (MethodNode method : node.methods) {
+            if (!method.name.equals("<init>")
+                    || !method.desc.equals("(Ljava/nio/file/Path;)V")) {
+                continue;
+            }
+            for (AbstractInsnNode instruction : method.instructions.toArray()) {
+                if (!(instruction instanceof MethodInsnNode call)
+                        || call.getOpcode() != Opcodes.INVOKESTATIC
+                        || !call.owner.equals("net/minecraft/util/Util")
+                        || !call.name.equals("nonCriticalIoPool")
+                        || !call.desc.equals("()Lnet/minecraft/TracingExecutor;")) {
+                    continue;
+                }
+                AbstractInsnNode next = call.getNext();
+                if (next instanceof MethodInsnNode existing
+                        && existing.getOpcode() == Opcodes.INVOKESTATIC
+                        && existing.owner.equals("dev/gaius/browser/BrowserCooperativeExecutor")
+                        && existing.name.equals("defer")
+                        && existing.desc.equals("(Ljava/util/concurrent/Executor;)"
+                                + "Ljava/util/concurrent/Executor;")) {
+                    patched++;
+                    continue;
+                }
+                method.instructions.insert(call, new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserCooperativeExecutor",
+                        "defer",
+                        "(Ljava/util/concurrent/Executor;)Ljava/util/concurrent/Executor;",
+                        false));
+                method.maxStack = Math.max(method.maxStack, 1);
+                patched++;
+            }
+        }
+        if (patched != 1) {
+            throw new IllegalStateException(
+                    "26.2 DownloadQueue cooperative executor patch points=" + patched);
+        }
+        write(node, output);
+        System.out.println("Patched 26.2 DownloadQueue with browser cooperative executor");
     }
 
     private static void patchNoiseChunkGraphMapper(String jar, Path root) throws IOException {

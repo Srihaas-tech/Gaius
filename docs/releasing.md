@@ -44,6 +44,31 @@ done
 These probes check STATUS, target attestation, and tunnel release, not LOGIN
 or PLAY. Keep their actual scope in release notes.
 
+The final `v0.1.0` prepare gate accepts independent multiplayer targets for
+each compiled profile while keeping one audited RelayNode. Defaults remain the
+public probe above; override only when the saved Chrome/CDP evidence was
+captured against different profile-specific servers:
+
+```powershell
+./tools/prepare-final-release-v0.1.0.ps1 `
+  -Singleplayer12111Evidence artifacts/file-entry-1.21.11.json `
+  -Singleplayer262Evidence artifacts/file-entry-26.2.json `
+  -Multiplayer12111Evidence artifacts/join-terrain-1.21.11.json `
+  -Multiplayer262Evidence artifacts/join-terrain-26.2.json `
+  -Multiplayer12111Target 'legacy.example:25565' `
+  -Multiplayer262Target 'modern.example:25565' `
+  -PagesDefaultTarget 't40.sjcmc.cn:14803'
+```
+
+The two multiplayer targets are bound into each evidence declaration and into
+`release.manifest.json` under `relay.targets`. They are independent from the
+public launcher defaults under `pages.defaultTarget` and
+`pages.defaultTargets`; `relay.target` is retained only as an alias for the
+home-page default. Publish and fresh-download gates revalidate both sets of
+bindings. The Pages CDP gate checks the displayed default on the home and each
+profile page, then injects the matching multiplayer evidence target when it
+verifies each release link.
+
 From a clean source checkout, build each supported Minecraft profile in its
 own state and output roots. The wrapper never changes `port/config.json` and
 does not reuse the legacy shared `port/target`, `port/work/overlays`, or
@@ -127,19 +152,31 @@ source port/scripts/version-profile.sh
 done > SHA256SUMS)
 ```
 
-Publish the locally verified tag and assets with GitHub CLI after reviewing
-the staged files and `SHA256SUMS`:
+For the already-published `v0.1.0` tag, do not recreate, force-update, or push
+the tag. Commit the release-gate changes on `main`, push `main`, prepare an
+exact-eight stage, then run the tracked publisher first without
+`-ExecuteUpload` and review its dry-run result:
 
-```sh
-version="$(tr -d '[:space:]' < VERSION)"
-git tag -a "v$version" -m "Gaius Client 1.21.11 + 26.2 v$version"
-git push origin main
-git push origin "v$version"
-gh release create "v$version" "$release_dir"/* \
-  --repo TypeThe0ry/Gaius \
-  --title "Gaius $version" \
-  --notes-file RELEASE_NOTES.md
+```powershell
+./tools/publish-final-release-v0.1.0.ps1 `
+  -Multiplayer12111EvidencePath artifacts/join-terrain-1.21.11.json `
+  -Multiplayer262EvidencePath artifacts/join-terrain-26.2.json
+
+./tools/publish-final-release-v0.1.0.ps1 `
+  -Multiplayer12111EvidencePath artifacts/join-terrain-1.21.11.json `
+  -Multiplayer262EvidencePath artifacts/join-terrain-26.2.json `
+  -ExecuteUpload
 ```
+
+The publisher requires a clean tracked `main`, `origin/main == HEAD`, no open
+pull requests or issues, an unchanged local/remote tag object, schema-v4
+manifest provenance, and the exact eight assets. It clobbers the eight named
+release assets, removes extras, performs a fresh download verification, then
+dispatches and verifies the uniquely-bound Pages run. Untracked local evidence
+and build output are permitted and remain outside the source provenance check.
+
+For a genuinely new version only, create a new annotated tag after all gates
+pass. Never repoint an existing published tag.
 
 Download every uploaded asset to a fresh directory, verify it against the
 published `SHA256SUMS`, and repeat the Chrome launch and single-player and

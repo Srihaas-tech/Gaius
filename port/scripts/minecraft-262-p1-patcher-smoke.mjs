@@ -986,6 +986,140 @@ try {
     encoding: "utf8", timeout: 30_000,
   });
 
+  const patchedSpriteContents = execFileSync(javap, ["-classpath", clientJar,
+    "-p", "-c", "net.minecraft.client.renderer.texture.SpriteContents"], {
+      encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+    });
+  const staticImageRelease = method(patchedSpriteContents,
+    "public void browserReleaseStaticImagesAfterUpload();",
+    "public void browserReleaseAllImagesBeforeReload();");
+  assert.equal(occurrences(staticImageRelease,
+    "NativeImage.close"), 1,
+  "26.2 static sprite release must close every retained native mip image");
+  assert.match(staticImageRelease, /Field animatedTexture/,
+    "26.2 static sprite release lost its animation guard");
+  assert.match(staticImageRelease, /anewarray\s+#[0-9]+\s+\/\/ class com\/mojang\/blaze3d\/platform\/NativeImage/,
+    "26.2 static sprite release must detach the closed mip array");
+  const allImageRelease = method(patchedSpriteContents,
+    "public void browserReleaseAllImagesBeforeReload();",
+    "public java.lang.String toString();");
+  assert.equal(occurrences(allImageRelease,
+    "NativeImage.close"), 1,
+  "26.2 pre-reload sprite release must close every retained native mip image");
+  assert.doesNotMatch(allImageRelease, /Field animatedTexture/,
+    "26.2 pre-reload sprite release must include animated sprites");
+  assert.match(allImageRelease, /anewarray\s+#[0-9]+\s+\/\/ class com\/mojang\/blaze3d\/platform\/NativeImage/,
+    "26.2 pre-reload sprite release must detach the closed mip array");
+
+  const patchedTextureAtlas = execFileSync(javap, ["-classpath", clientJar,
+    "-p", "-c", "net.minecraft.client.renderer.texture.TextureAtlas"], {
+      encoding: "utf8", maxBuffer: 12 * 1024 * 1024, timeout: 30_000,
+    });
+  const atlasInitialUpload = method(patchedTextureAtlas,
+    "private void uploadInitialContents();",
+    "public void dumpContents(");
+  assert.equal(occurrences(atlasInitialUpload,
+    "browserReleaseStaticSpriteImages"), 1,
+  "26.2 initial atlas upload must release static CPU images exactly once");
+  assert.ok(atlasInitialUpload.lastIndexOf("browserReleaseStaticSpriteImages")
+      > atlasInitialUpload.indexOf("Method uploadAnimationFrames:()V"),
+  "26.2 atlas CPU-image release must run after the final initial texture upload");
+  const atlasStaticRelease = method(patchedTextureAtlas,
+    "private void browserReleaseStaticSpriteImages();");
+  assert.equal(occurrences(atlasStaticRelease,
+    "SpriteContents.browserReleaseStaticImagesAfterUpload"), 1,
+  "26.2 atlas static release helper must visit every sprite contents object");
+  const atlasUpload = method(patchedTextureAtlas,
+    "public void upload(net.minecraft.client.renderer.texture.SpriteLoader$Preparations);",
+    "private void uploadInitialContents();");
+  assert.equal(occurrences(atlasUpload,
+    "browserReleaseOldSpriteImagesBeforeReload"), 1,
+  "26.2 atlas reload must release old sprite images exactly once");
+  assert.ok(atlasUpload.indexOf("browserReleaseOldSpriteImagesBeforeReload")
+      < atlasUpload.indexOf("Method createTexture:(III)V"),
+  "26.2 atlas reload must release old sprite images before allocating the replacement atlas");
+  const atlasOldRelease = method(patchedTextureAtlas,
+    "private void browserReleaseOldSpriteImagesBeforeReload();",
+    "public void browserPrepareForSpriteReload();");
+  assert.equal(occurrences(atlasOldRelease,
+    "SpriteContents.browserReleaseAllImagesBeforeReload"), 1,
+  "26.2 old atlas release helper must visit every previous sprite contents object");
+  const atlasPrepareForReload = method(patchedTextureAtlas,
+    "public void browserPrepareForSpriteReload();");
+  assert.equal(occurrences(atlasPrepareForReload,
+    "SpriteContents$AnimationState.close"), 1,
+  "26.2 pre-reload helper must close every detached animation state");
+  assert.equal(occurrences(atlasPrepareForReload,
+    "GpuBuffer.close"), 1,
+  "26.2 pre-reload helper must close the old animated-sprite UBO");
+  assert.equal(occurrences(atlasPrepareForReload,
+    "browserReleaseOldSpriteImagesBeforeReload"), 1,
+  "26.2 pre-reload helper must release old sprite CPU images exactly once");
+  const detachAnimationStates = atlasPrepareForReload.lastIndexOf(
+    "Field animatedTexturesStates:Ljava/util/List;");
+  const closeAnimationStates = atlasPrepareForReload.indexOf(
+    "SpriteContents$AnimationState.close");
+  const closeSpriteUbo = atlasPrepareForReload.indexOf("GpuBuffer.close");
+  const nullSpriteUbo = atlasPrepareForReload.indexOf(
+    "Field spriteUbos:Lcom/mojang/blaze3d/buffers/GpuBuffer;", closeSpriteUbo + 1);
+  const releaseOldSpriteImages = atlasPrepareForReload.indexOf(
+    "browserReleaseOldSpriteImagesBeforeReload");
+  assert.ok(detachAnimationStates >= 0
+      && closeAnimationStates > detachAnimationStates
+      && closeSpriteUbo > closeAnimationStates
+      && nullSpriteUbo > closeSpriteUbo
+      && releaseOldSpriteImages > nullSpriteUbo,
+  "26.2 pre-reload helper must detach animation ticks, close animation GPU state, "
+      + "null the sprite UBO, then release old CPU images");
+  assert.match(atlasPrepareForReload,
+    /aconst_null\s+\d+: putfield\s+#[0-9]+\s+\/\/ Field spriteUbos:Lcom\/mojang\/blaze3d\/buffers\/GpuBuffer;/,
+  "26.2 pre-reload helper must null the closed sprite UBO");
+
+  const patchedAtlasManager = execFileSync(javap, ["-classpath", clientJar,
+    "-p", "-c", "net.minecraft.client.resources.model.sprite.AtlasManager"], {
+      encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+    });
+  const atlasManagerConstructor = method(patchedAtlasManager,
+    "public net.minecraft.client.resources.model.sprite.AtlasManager(net.minecraft.client.renderer.texture.TextureManager, int);",
+    "public net.minecraft.client.renderer.texture.TextureAtlas getAtlasOrThrow");
+  assert.match(atlasManagerConstructor,
+    /iconst_0\s+\d+: putfield\s+#[0-9]+\s+\/\/ Field maxMipmapLevels:I/,
+    "26.2 browser AtlasManager constructor must cap mipmaps at zero");
+  const updateMaxMipLevel = method(patchedAtlasManager,
+    "public void updateMaxMipLevel(int);",
+    "public void close();");
+  assert.match(updateMaxMipLevel,
+    /iconst_0\s+\d+: putfield\s+#[0-9]+\s+\/\/ Field maxMipmapLevels:I/,
+    "26.2 browser AtlasManager updates must preserve the zero-mipmap cap");
+  const atlasManagerReload = method(patchedAtlasManager,
+    "public java.util.concurrent.CompletableFuture<java.lang.Void> reload(",
+    "private void updateSpriteMaps(");
+  assert.equal(occurrences(atlasManagerReload,
+    "browserReleaseAtlasImagesBeforeReload"), 1,
+  "26.2 atlas manager must release retained images once before preparing replacements");
+  const atlasManagerReloadInstructions = bytecodeInstructions(atlasManagerReload);
+  assert.ok(atlasManagerReloadInstructions[0]?.instruction === "aload_0"
+      && atlasManagerReloadInstructions[1]?.instruction
+        .includes("browserReleaseAtlasImagesBeforeReload"),
+  "26.2 atlas manager must release old images before any replacement atlas load is scheduled");
+  const atlasManagerRelease = method(patchedAtlasManager,
+    "private void browserReleaseAtlasImagesBeforeReload();");
+  assert.equal(occurrences(atlasManagerRelease,
+    "TextureAtlas.browserPrepareForSpriteReload"), 1,
+  "26.2 atlas manager release helper must visit every existing atlas");
+  const patchedPendingStitches = execFileSync(javap, ["-classpath", clientJar,
+    "-p", "-c",
+    "net.minecraft.client.resources.model.sprite.AtlasManager$PendingStitchResults"], {
+      encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+    });
+  const pendingJoinAndUpload = method(patchedPendingStitches,
+    "public java.util.Map<net.minecraft.client.resources.model.sprite.SpriteId, net.minecraft.client.renderer.texture.TextureAtlasSprite> joinAndUpload();",
+    "public java.util.concurrent.CompletableFuture<net.minecraft.client.renderer.texture.SpriteLoader$Preparations> get(");
+  assert.equal(occurrences(pendingJoinAndUpload, "java/util/List.clear:()V"), 0,
+    "26.2 atlas upload must not invalidate shared reload state before all listeners finish");
+  assert.equal(occurrences(pendingJoinAndUpload, "java/util/Map.clear:()V"), 0,
+    "26.2 atlas upload must retain futures queried through PendingStitchResults.get");
+
   // Verify the client crack overlay probe was inserted into the actual ASM
   // methods, rather than merely checking source names or patcher strings.
   const patchedClientLevel = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
@@ -1221,6 +1355,27 @@ try {
   const patched121PacketProcessor = execFileSync(javap, [
     "-classpath", generic121Jar, "-p", "-c", "net.minecraft.network.PacketProcessor",
   ], {encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000});
+  const patchedBlockableEventLoop = execFileSync(javap, [
+    "-classpath", clientJar, "-p", "-c", "net.minecraft.util.thread.BlockableEventLoop",
+  ], {encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000});
+  const patched121BlockableEventLoop = execFileSync(javap, [
+    "-classpath", generic121Jar, "-p", "-c", "net.minecraft.util.thread.BlockableEventLoop",
+  ], {encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000});
+  for (const [profileId, blockableEventLoop] of [
+    ["26.2", patchedBlockableEventLoop],
+    ["1.21.11", patched121BlockableEventLoop],
+  ]) {
+    const doRunTask = method(blockableEventLoop,
+      "protected void doRunTask(R);", "public void schedule(R);");
+    const begin = doRunTask.indexOf(
+      "BrowserIntegratedServerMain.beginScheduledNetworkInputTask");
+    const taskRun = doRunTask.indexOf("java/lang/Runnable.run");
+    assert.ok(begin >= 0 && taskRun > begin,
+      `${profileId} doRunTask must acquire the exact network-task lease before dispatch`);
+    assert.equal(occurrences(doRunTask,
+      "BrowserIntegratedServerMain.endScheduledNetworkInputTask"), 2,
+    `${profileId} doRunTask must release the network-task lease on return and exception`);
+  }
   assertPacketProcessorQueueContract(patchedPacketProcessor, "26.2");
   assertPacketProcessorQueueContract(patched121PacketProcessor, "1.21.11");
   assertPacketProcessorLifecycleContract(patchedPacketProcessor, "26.2");

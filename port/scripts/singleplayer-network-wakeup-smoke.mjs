@@ -44,7 +44,7 @@ assert.ok(
   "coalesced signals must not refresh the active burst budget",
 );
 const enqueue = schedule.indexOf(
-  "current.schedule(new TickTask(Integer.MIN_VALUE, NETWORK_INPUT_TASK))",
+  "TickTask task = new TickTask(Integer.MIN_VALUE, NETWORK_INPUT_TASK)",
 );
 assert.ok(enqueue >= 0, "network task must use an overdue TickTask");
 assert.ok(
@@ -62,8 +62,38 @@ assert.ok(
     pendingPump.indexOf("BrowserWebSocketChannel.hasPendingInput"),
   "the server-loop thread binding must happen before pending input is drained",
 );
-assert.match(run, /pumped = drainUrgentPackets\(\);/);
+const strictDrainStart = source.indexOf("private static boolean drainUrgentPackets()");
+const scheduledDrainStart = source.indexOf(
+  "private static boolean drainScheduledNetworkInput()",
+  strictDrainStart,
+);
+const sharedDrainStart = source.indexOf(
+  "private static boolean drainUrgentPacketsFromServerLoop(MinecraftServer current)",
+  scheduledDrainStart,
+);
+assert.ok(strictDrainStart >= 0 && scheduledDrainStart > strictDrainStart &&
+  sharedDrainStart > scheduledDrainStart);
+const strictDrain = source.slice(strictDrainStart, scheduledDrainStart);
+const scheduledDrain = source.slice(scheduledDrainStart, sharedDrainStart);
+assert.match(strictDrain, /Thread\.currentThread\(\) != serverThread/,
+  "generic packet drains must retain strict server-thread identity");
+assert.match(scheduledDrain, /serverThreadExited \|\| !current\.isRunning\(\)/,
+  "the private scheduled task must retain the server lifecycle guard");
+assert.match(scheduledDrain, /!NETWORK_INPUT_TASK_SCHEDULED\.get\(\)/,
+  "the private scheduled task must possess the one-task permit");
+assert.match(scheduledDrain, /activeNetworkInputTask == null/,
+  "the private scheduled task must hold an exact-dispatch lease");
+assert.doesNotMatch(scheduledDrain, /Thread\.currentThread\(\) != serverThread/,
+  "TeaVM Thread wrapper identity must not reject a task consumed by the server queue");
+assert.match(source, /task instanceof TickTask/,
+  "only a TickTask may acquire the network-input lease");
+assert.match(source, /tickTask\.getTick\(\) != Integer\.MIN_VALUE/,
+  "only the reserved overdue network TickTask may acquire the network-input lease");
+assert.match(source, /beginScheduledNetworkInputTask\(Runnable task\)/);
+assert.match(source, /endScheduledNetworkInputTask\(Runnable task, boolean entered\)/);
+assert.match(run, /pumped = drainScheduledNetworkInput\(\);/);
 assert.match(run, /network-pump-wrong-thread/);
+assert.match(run, /lost its integrated server lifecycle permit/);
 assert.match(run, /finally\s*\{\s*NETWORK_INPUT_TASK_SCHEDULED\.set\(false\);/s);
 assert.match(run, /retryNetworkInputAfterTaskFailure\(\);/);
 assert.match(run, /Pending input remained after the integrated server stopped/);
@@ -138,11 +168,17 @@ const finishBurstModel = () => {
 };
 const runModel = ({
   pendingAfterPump,
-  pumpSucceeded = true,
+  lifecyclePermit = true,
+  threadWrapperMatches = true,
+  exactTask = true,
   resumeDeferred = true,
 }) => {
   scheduled = false;
   runs++;
+  // A task consumed from the private server queue is trusted even when TeaVM restores it with a
+  // different Java Thread wrapper. Only a lost lifecycle/one-task permit makes the drain fail.
+  const pumpSucceeded = lifecyclePermit && exactTask;
+  void threadWrapperMatches;
   if (!pumpSucceeded) {
     wrongThread++;
     if (!pendingInput) {
@@ -244,13 +280,31 @@ assert.equal(scheduled, false);
 
 signalModel();
 const serverThreadRunsBeforeWrongThread = serverThreadRuns;
-runModel({pendingAfterPump: true, pumpSucceeded: false});
-assert.equal(wrongThread, 1);
-assert.equal(scheduled, true, "wrong-thread execution must retain a bounded retry");
-assert.equal(pendingInput, true, "wrong-thread execution must retain queued input");
-runModel({pendingAfterPump: false});
+runModel({pendingAfterPump: false, threadWrapperMatches: false});
+assert.equal(wrongThread, 0,
+  "a scheduled server task must survive TeaVM Thread wrapper replacement");
 assert.equal(serverThreadRuns - serverThreadRunsBeforeWrongThread, 1,
-  "a wrong-thread task must be followed by exactly one server-thread execution");
+  "wrapper replacement must still produce exactly one trusted server-queue drain");
+assert.equal(scheduled, false);
+assert.equal(pendingInput, false);
+
+signalModel();
+runModel({pendingAfterPump: true, exactTask: false});
+assert.equal(wrongThread, 1,
+  "a different queued runnable must not acquire the network-input lease");
+assert.equal(scheduled, true);
+runModel({pendingAfterPump: false});
+
+signalModel();
+const serverThreadRunsBeforePermitFailure = serverThreadRuns;
+const wrongThreadBeforePermitFailure = wrongThread;
+runModel({pendingAfterPump: true, lifecyclePermit: false});
+assert.equal(wrongThread - wrongThreadBeforePermitFailure, 1);
+assert.equal(scheduled, true, "lost-permit execution must retain a bounded retry");
+assert.equal(pendingInput, true, "lost-permit execution must retain queued input");
+runModel({pendingAfterPump: false});
+assert.equal(serverThreadRuns - serverThreadRunsBeforePermitFailure, 1,
+  "a lost-permit task must be followed by exactly one trusted server-queue execution");
 assert.equal(scheduled, false);
 assert.equal(pendingInput, false);
 assert.equal(deferredRetriesRemaining, 0,
@@ -259,7 +313,7 @@ assert.equal(deferredRetriesRemaining, 0,
 const wrongThreadRetryExhaustionsBefore = retryExhaustions;
 signalModel();
 for (let index = 0; index < 5; index++) {
-  runModel({pendingAfterPump: true, pumpSucceeded: false});
+  runModel({pendingAfterPump: true, lifecyclePermit: false});
 }
 assert.equal(retryExhaustions - wrongThreadRetryExhaustionsBefore, 1,
   "a permanently wrong-thread task must fail closed after bounded retries");
@@ -298,6 +352,8 @@ console.log(JSON.stringify({
   followups,
   runs,
   boundedFollowupDrain: true,
+  scheduledTaskIgnoresTeaVMThreadWrapperIdentity: true,
+  genericDrainRetainsStrictThreadIdentity: true,
   wrongThreadRetriesBounded: true,
   wrongThreadExactlyOnceServerRun: true,
   wrongThreadFailClosed: true,

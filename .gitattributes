@@ -15,6 +15,10 @@
 *.jar binary
 *.wasm binary
 
+# The fixed multiplayer acceptance resource pack is served by GitHub Pages.
+# Store it in LFS, and make the Pages workflow materialize LFS objects before upload.
+docs/resource-packs/*.zip filter=lfs diff=lfs merge=lfs -text
+
 # The checked-in browser release is one coherent deliverable. Keep it in this
 # repository through Git LFS so source and a downloadable build share a commit
 # without placing large blobs in ordinary Git history.

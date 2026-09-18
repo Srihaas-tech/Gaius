@@ -34,6 +34,9 @@ public final class MinecraftServerWorkerPatcher {
             "net/minecraft/server/level/ChunkTaskDispatcher";
     private static final String TASK_SCHEDULER = "net/minecraft/util/thread/TaskScheduler";
     private static final String WORLDGEN_EXECUTOR_NAME = "worldgen-dispatcher";
+    private static final String WORLDGEN_DISPATCHER_SCHEDULER =
+            "dev/gaius/browser/BrowserWorldgenDispatcherScheduler";
+    private static final String DEFERRED_REGISTER = "gaius$registerForExecutionDeferred";
 
     private MinecraftServerWorkerPatcher() {
     }
@@ -64,7 +67,7 @@ public final class MinecraftServerWorkerPatcher {
         if (jsonRpcPatched) {
             System.out.println("Disabled the dedicated JSON-RPC management server for the browser Worker");
         }
-        System.out.println("Patched worldgen PriorityConsecutiveExecutor with single-task cooperative turns");
+        System.out.println("Patched worldgen PriorityConsecutiveExecutor with deferred single-task turns");
     }
 
     private static void patchChunkTaskDispatcher(ClassNode node) {
@@ -137,10 +140,10 @@ public final class MinecraftServerWorkerPatcher {
         code.add(new JumpInsnNode(Opcodes.IFEQ, vanilla));
 
         // A worldgen runnable can suspend through ChunkGenerationTask.runUntilWait().
-        // Execute one dispatcher task and return the executor turn immediately.  The
-        // existing setSleeping/registerForExecution pair schedules a later turn when the
-        // queue still has work; continuing this loop here would drain resumed generation
-        // futures inside the same MinecraftServer tick.
+        // Execute one dispatcher task and return the executor turn immediately. TeaVM's
+        // Worker executor invokes execute() synchronously, so the vanilla registration path
+        // would recursively drain the queue in this same JavaScript turn. The deferred path
+        // marks the dispatcher running now, then submits it from a fresh native-thread turn.
         code.add(worldgenStart);
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
@@ -153,7 +156,7 @@ public final class MinecraftServerWorkerPatcher {
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR,
-                "registerForExecution", "()V", false));
+                DEFERRED_REGISTER, "()V", false));
         code.add(new JumpInsnNode(Opcodes.GOTO, end));
 
         code.add(vanilla);
@@ -180,7 +183,7 @@ public final class MinecraftServerWorkerPatcher {
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR,
-                "registerForExecution", "()V", false));
+                DEFERRED_REGISTER, "()V", false));
         code.add(new VarInsnNode(Opcodes.ALOAD, 2));
         code.add(new InsnNode(Opcodes.ATHROW));
 
@@ -215,6 +218,39 @@ public final class MinecraftServerWorkerPatcher {
                 vanillaStart, vanillaDone, vanillaCatch, null));
         run.maxStack = 3;
         run.maxLocals = 5;
+        addDeferredRegisterMethod(node);
+    }
+
+    private static void addDeferredRegisterMethod(ClassNode node) {
+        if (node.methods.stream().anyMatch(method -> method.name.equals(DEFERRED_REGISTER))) {
+            throw new IllegalStateException(
+                    ABSTRACT_EXECUTOR + "." + DEFERRED_REGISTER + " already exists");
+        }
+        MethodNode method = new MethodNode(
+                Opcodes.ACC_PRIVATE, DEFERRED_REGISTER, "()V", null, null);
+        LabelNode done = new LabelNode();
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR, "canBeScheduled", "()Z", false));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR, "setRunning", "()Z", false));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD, ABSTRACT_EXECUTOR, "executor", "Ljava/util/concurrent/Executor;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC, WORLDGEN_DISPATCHER_SCHEDULER, "defer",
+                "(Ljava/util/concurrent/Executor;Ljava/lang/Runnable;)V", false));
+        code.add(done);
+        code.add(new InsnNode(Opcodes.RETURN));
+        method.instructions = code;
+        method.maxStack = 2;
+        method.maxLocals = 1;
+        node.methods.add(method);
     }
 
     private static MethodNode find(ClassNode node, String name, String descriptor) {

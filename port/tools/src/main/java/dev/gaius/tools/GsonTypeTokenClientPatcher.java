@@ -137,12 +137,46 @@ public final class GsonTypeTokenClientPatcher {
             initializer.instructions.remove(constructor);
             replacements++;
         }
+        if (replacements == 0 && hasExplicitTypeTokenConstruction(initializer, rawType)) {
+            // Idempotent release/resume path: the client overlay can already contain
+            // the explicit GsonTypes + TypeToken.get sequence from an earlier pass.
+            return;
+        }
         if (replacements != 1) {
             throw new IllegalStateException(
                     "Expected one anonymous TypeToken construction in " + node.name
                             + ", got " + replacements);
         }
         initializer.maxStack = Math.max(initializer.maxStack, 6);
+    }
+
+    private static boolean hasExplicitTypeTokenConstruction(
+            MethodNode initializer, String rawType) {
+        boolean sawRawType = false;
+        boolean sawParameterizedFactory = false;
+        boolean sawTypeTokenGet = false;
+        for (AbstractInsnNode instruction = initializer.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof LdcInsnNode constant
+                    && constant.cst instanceof Type type
+                    && type.equals(Type.getObjectType(rawType))) {
+                sawRawType = true;
+            } else if (instruction instanceof MethodInsnNode call) {
+                if (call.getOpcode() == Opcodes.INVOKESTATIC
+                        && call.owner.equals("com/google/gson/internal/GsonTypes")
+                        && call.name.equals("newParameterizedTypeWithOwner")) {
+                    sawParameterizedFactory = true;
+                } else if (call.getOpcode() == Opcodes.INVOKESTATIC
+                        && call.owner.equals("com/google/gson/reflect/TypeToken")
+                        && call.name.equals("get")
+                        && call.desc.equals("(Ljava/lang/reflect/Type;)"
+                                + "Lcom/google/gson/reflect/TypeToken;")) {
+                    sawTypeTokenGet = true;
+                }
+            }
+        }
+        return sawRawType && sawParameterizedFactory && sawTypeTokenGet;
     }
 
     private static InsnNode pushSmallInteger(int value) {

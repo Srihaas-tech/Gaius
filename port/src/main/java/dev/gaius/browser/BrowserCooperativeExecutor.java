@@ -67,9 +67,13 @@ public final class BrowserCooperativeExecutor implements Executor {
             return;
         }
         pumpScheduled = true;
-        // A zero-delay platform task yields to the Worker message queue without depending on
-        // window/requestAnimationFrame, which is unavailable to the integrated server Worker.
-        Platform.schedule(this::runAfterYield, 0);
+        // Keep the zero-delay browser yield, but enter the callback through TeaVM's native-
+        // thread bootstrap. Platform.schedule invokes PlatformRunnable from a raw timer
+        // callback; a queued task such as HttpUtil.downloadFile can suspend while fetching a
+        // resource pack, and that raw callback has no current TeaVM thread to suspend. The
+        // startThread path uses the same deferred browser turn while installing the continuation
+        // context required by suspendable CompletableFuture tasks.
+        Platform.startThread(this::runAfterYield);
     }
 
     private void runAfterYield() {

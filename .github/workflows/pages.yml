@@ -1,4 +1,5 @@
 name: Deploy Gaius GitHub Pages
+run-name: Deploy Gaius Pages [${{ inputs.release_token || github.sha }}]
 
 on:
   push:
@@ -8,6 +9,11 @@ on:
       - relay-nodes.json
       - .github/workflows/pages.yml
   workflow_dispatch:
+    inputs:
+      release_token:
+        description: Unique token binding a release publish to this Pages run
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -27,12 +33,31 @@ jobs:
     steps:
       - name: Check out Pages source
         uses: actions/checkout@v4
+        with:
+          lfs: true
       - name: Configure Pages
         uses: actions/configure-pages@v5
+      - name: Download the two version files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf pages-publish
+          mkdir -p pages-publish
+          gh release download v0.1.0 \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern 'Gaius-1.21.11.html' \
+            --pattern 'Gaius-26.2.html' \
+            --dir pages-publish \
+            --clobber
+          test "$(find pages-publish -maxdepth 1 -type f | wc -l)" -eq 2
+          test -f pages-publish/Gaius-1.21.11.html
+          test -f pages-publish/Gaius-26.2.html
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: docs
+          path: pages-publish
       - name: Deploy Pages
         id: deployment
         uses: actions/deploy-pages@v4
